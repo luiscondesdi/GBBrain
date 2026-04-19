@@ -1,0 +1,13 @@
+[package]
+name = "gbbrain-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+gbbrain-core = { path = "../core" }
+gbbrain-gb = { path = "../gb" }
+
+[[bin]]
+name = "gbbrain"
+path = "src/main.rs"

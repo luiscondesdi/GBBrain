@@ -1,0 +1,8 @@
+/target
+/roms
+/.codex
+*.gb
+*.gbc
+*.gba
+*.sav
+*.state

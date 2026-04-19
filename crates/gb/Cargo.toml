@@ -1,0 +1,11 @@
+[package]
+name = "gbbrain-gb"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+gbbrain-core = { path = "../core" }
+
+[lib]
+path = "src/lib.rs"
