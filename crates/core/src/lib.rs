@@ -35,6 +35,8 @@ pub trait MachineControl {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MachineSnapshot {
     pub registers: CpuRegisters,
+    pub halted: bool,
+    pub instruction_counter: u64,
 }
 
 /// CPU register file normalized across starter use cases.
@@ -76,6 +78,7 @@ pub enum StopReason {
     WatchpointHit,
     Halted,
     FrameComplete,
+    RunLimitReached,
 }
 
 /// Result of a run-control operation.

@@ -1,5 +1,6 @@
 /target
 /roms
+/test-roms
 /.codex
 *.gb
 *.gbc
