@@ -91,6 +91,7 @@ pub struct RunResult {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Breakpoint {
     ProgramCounter(u32),
+    Opcode(u8),
     MemoryRead(u32),
     MemoryWrite(u32),
 }

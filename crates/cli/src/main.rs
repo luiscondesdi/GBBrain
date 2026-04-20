@@ -1,8 +1,8 @@
 use std::{
     env, fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -278,71 +278,140 @@ fn discover_mooneye_dmg_roms() -> Vec<PathBuf> {
 
 fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     const STEP_LIMIT: usize = 2_000_000;
+    const RUN_CHUNK: u64 = 4_096;
+    const HALT_SPIN_LIMIT: usize = 50_000;
 
-    let rom = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let mut client = match StdioSession::spawn() {
+        Ok(client) => client,
         Err(error) => {
             return SuiteResult {
                 status: SuiteStatus::Error,
-                detail: Some(format!("failed to read ROM: {error}")),
+                detail: Some(format!("failed to start gbbrain serve: {error}")),
                 serial_output: String::new(),
             };
         }
     };
 
-    let mut machine = match GbMachine::new(rom) {
-        Ok(machine) => machine,
-        Err(error) => {
+    if let Err(error) = client.load_rom(path) {
+        return SuiteResult {
+            status: SuiteStatus::Error,
+            detail: Some(error),
+            serial_output: String::new(),
+        };
+    }
+
+    let is_mooneye = path
+        .components()
+        .any(|component| component.as_os_str() == "mooneye");
+    if is_mooneye {
+        if let Err(error) = client.add_breakpoint("opcode", 0x40) {
             return SuiteResult {
                 status: SuiteStatus::Error,
-                detail: Some(error.to_string()),
+                detail: Some(error),
                 serial_output: String::new(),
             };
         }
-    };
+    }
 
-    for _ in 0..STEP_LIMIT {
-        if let Some(result) = detect_mooneye_result(&machine) {
-            return SuiteResult {
-                status: result,
-                detail: Some("detected Mooneye pass/fail signature".to_string()),
-                serial_output: String::from_utf8_lossy(machine.serial_output()).into_owned(),
-            };
-        }
+    let mut executed = 0_usize;
+    let mut halt_spins = 0_usize;
+    while executed < STEP_LIMIT {
+        let serial_output = match client.serial_output() {
+            Ok(serial_output) => serial_output,
+            Err(error) => {
+                return SuiteResult {
+                    status: SuiteStatus::Error,
+                    detail: Some(error),
+                    serial_output: String::new(),
+                };
+            }
+        };
 
-        let serial = String::from_utf8_lossy(machine.serial_output());
-        if serial.contains("Passed") || serial.contains("passed") {
+        if serial_output.contains("Passed") || serial_output.contains("passed") {
             return SuiteResult {
                 status: SuiteStatus::Pass,
                 detail: Some("detected Blargg serial success output".to_string()),
-                serial_output: serial.into_owned(),
+                serial_output,
             };
         }
-        if serial.contains("Failed") || serial.contains("failed") {
+        if serial_output.contains("Failed") || serial_output.contains("failed") {
             return SuiteResult {
                 status: SuiteStatus::Fail,
                 detail: Some("detected Blargg serial failure output".to_string()),
-                serial_output: serial.into_owned(),
+                serial_output,
             };
         }
 
-        match machine.step_instruction() {
-            Ok(result) => {
-                if result.stop_reason == StopReason::Halted {
-                    break;
+        let remaining = STEP_LIMIT - executed;
+        let batch = remaining.min(RUN_CHUNK as usize) as u64;
+        match client.run(batch) {
+            Ok(outcome) => {
+                executed = outcome.instruction_counter as usize;
+                if is_mooneye && outcome.stop_reason == "breakpoint_hit" {
+                    match client.snapshot() {
+                        Ok(snapshot) => {
+                            if let Some(result) = detect_mooneye_result(&snapshot) {
+                                return SuiteResult {
+                                    status: result,
+                                    detail: Some(
+                                        "detected Mooneye pass/fail signature at opcode breakpoint"
+                                            .to_string(),
+                                    ),
+                                    serial_output: client.serial_output().unwrap_or(serial_output),
+                                };
+                            }
+                        }
+                        Err(error) => {
+                            return SuiteResult {
+                                status: SuiteStatus::Error,
+                                detail: Some(error),
+                                serial_output,
+                            };
+                        }
+                    }
+
+                    if let Err(error) = client.clear_breakpoints() {
+                        return SuiteResult {
+                            status: SuiteStatus::Error,
+                            detail: Some(error),
+                            serial_output,
+                        };
+                    }
+                    if let Err(error) = client.step(1) {
+                        return SuiteResult {
+                            status: SuiteStatus::Error,
+                            detail: Some(error),
+                            serial_output,
+                        };
+                    }
+                    if let Err(error) = client.add_breakpoint("opcode", 0x40) {
+                        return SuiteResult {
+                            status: SuiteStatus::Error,
+                            detail: Some(error),
+                            serial_output,
+                        };
+                    }
                 }
+                if outcome.stop_reason == "halted" {
+                    halt_spins += 1;
+                    if halt_spins >= HALT_SPIN_LIMIT {
+                        break;
+                    }
+                    continue;
+                }
+                halt_spins = 0;
             }
             Err(error) => {
                 return SuiteResult {
                     status: SuiteStatus::Unsupported,
-                    detail: Some(error.to_string()),
-                    serial_output: String::from_utf8_lossy(machine.serial_output()).into_owned(),
+                    detail: Some(error),
+                    serial_output: client.serial_output().unwrap_or_default(),
                 };
             }
         }
     }
 
-    let serial_output = String::from_utf8_lossy(machine.serial_output()).into_owned();
+    let serial_output = client.serial_output().unwrap_or_default();
     let detail = if serial_output.is_empty() {
         "no pass/fail signature before step limit or halt".to_string()
     } else {
@@ -356,20 +425,10 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     }
 }
 
-fn detect_mooneye_result(machine: &GbMachine) -> Option<SuiteStatus> {
-    let snapshot = machine.snapshot();
-    let pc = snapshot.registers.pc;
-    let opcode = machine
-        .inspect_memory(MemoryRegion::AddressSpace(gbbrain_core::AddressSpace::System), pc, 1)
-        .and_then(|bytes| bytes.first().copied())?;
-
-    if opcode != 0x40 {
-        return None;
-    }
-
-    let regs = &snapshot.registers;
-    let pass = [regs.b, regs.c, regs.d, regs.e, regs.h, regs.l] == [3, 5, 8, 13, 21, 34];
-    let fail = [regs.b, regs.c, regs.d, regs.e, regs.h, regs.l] == [0x42; 6];
+fn detect_mooneye_result(snapshot: &SnapshotDto) -> Option<SuiteStatus> {
+    let pass = [snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l]
+        == [3, 5, 8, 13, 21, 34];
+    let fail = [snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l] == [0x42; 6];
 
     if pass {
         Some(SuiteStatus::Pass)
@@ -377,6 +436,170 @@ fn detect_mooneye_result(machine: &GbMachine) -> Option<SuiteStatus> {
         Some(SuiteStatus::Fail)
     } else {
         None
+    }
+}
+
+struct StdioSession {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+struct RunOutcome {
+    stop_reason: String,
+    instruction_counter: usize,
+}
+
+impl StdioSession {
+    fn spawn() -> Result<Self, String> {
+        let exe = env::current_exe().map_err(|error| format!("failed to resolve current executable: {error}"))?;
+        let mut child = Command::new(exe)
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| format!("failed to launch server process: {error}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "server process did not expose stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "server process did not expose stdout".to_string())?;
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+        })
+    }
+
+    fn load_rom(&mut self, path: &Path) -> Result<(), String> {
+        self.request(json!({
+            "command": "load_rom",
+            "path": path
+        }))
+        .map(|_| ())
+    }
+
+    fn snapshot(&mut self) -> Result<SnapshotDto, String> {
+        let response = self.request(json!({ "command": "snapshot" }))?;
+        serde_json::from_value::<SnapshotResponse>(response)
+            .map(|response| response.snapshot)
+            .map_err(|error| format!("invalid snapshot response: {error}"))
+    }
+
+    fn serial_output(&mut self) -> Result<String, String> {
+        let response = self.request(json!({
+            "command": "get_serial_output",
+            "encoding": "text"
+        }))?;
+        serde_json::from_value::<SerialOutputResponse>(response)
+            .map(|response| response.text)
+            .map_err(|error| format!("invalid serial output response: {error}"))
+    }
+
+    fn step(&mut self, count: u64) -> Result<String, String> {
+        let response = self.request(json!({
+            "command": "step",
+            "count": count
+        }))?;
+        serde_json::from_value::<RunResponse>(response)
+            .map(|response| response.stop_reason)
+            .map_err(|error| format!("invalid step response: {error}"))
+    }
+
+    fn add_breakpoint(&mut self, kind: &str, address: u32) -> Result<(), String> {
+        self.request(json!({
+            "command": "add_breakpoint",
+            "kind": kind,
+            "address": address
+        }))
+        .map(|_| ())
+    }
+
+    fn clear_breakpoints(&mut self) -> Result<(), String> {
+        self.request(json!({ "command": "clear_breakpoints" }))
+            .map(|_| ())
+    }
+
+    fn run(&mut self, max_instructions: u64) -> Result<RunOutcome, String> {
+        let response = self.request(json!({
+            "command": "run",
+            "max_instructions": max_instructions
+        }))?;
+        serde_json::from_value::<RunResponse>(response)
+            .map(|response| RunOutcome {
+                stop_reason: response.stop_reason,
+                instruction_counter: response.snapshot.instruction_counter as usize,
+            })
+            .map_err(|error| format!("invalid run response: {error}"))
+    }
+
+    fn shutdown(&mut self) -> Result<(), String> {
+        self.request(json!({ "command": "shutdown" })).map(|_| ())
+    }
+
+    fn request(&mut self, request: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut envelope = request;
+        envelope["id"] = json!(id);
+
+        serde_json::to_writer(&mut self.stdin, &envelope)
+            .map_err(|error| format!("failed to send request: {error}"))?;
+        self.stdin
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to terminate request: {error}"))?;
+        self.stdin
+            .flush()
+            .map_err(|error| format!("failed to flush request: {error}"))?;
+
+        let mut line = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read response: {error}"))?;
+
+        if read == 0 {
+            return Err("server process closed stdout".to_string());
+        }
+
+        let response: ResponseEnvelope =
+            serde_json::from_str(&line).map_err(|error| format!("invalid response JSON: {error}"))?;
+
+        if response.id != Some(json!(id)) {
+            return Err(format!(
+                "response id mismatch: expected {id}, got {}",
+                response
+                    .id
+                    .map(|value: Value| value.to_string())
+                    .unwrap_or_else(|| "null".to_string())
+            ));
+        }
+
+        if response.ok {
+            response
+                .data
+                .ok_or_else(|| "server response omitted data".to_string())
+        } else {
+            Err(response
+                .error
+                .unwrap_or_else(|| "server returned an unspecified error".to_string()))
+        }
+    }
+}
+
+impl Drop for StdioSession {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+        let _ = self.child.wait();
     }
 }
 
@@ -422,7 +645,8 @@ impl SessionState {
                     "clear_serial_output",
                     "render_frame",
                     "shutdown"
-                ]
+                ],
+                "breakpoint_kinds": ["pc", "opcode", "memory_read", "memory_write"]
             })),
             Request::LoadRom { path } => self.load_rom(path),
             Request::Reset => {
@@ -665,7 +889,7 @@ enum Request {
     Shutdown,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SnapshotDto {
     pc: u32,
     sp: u32,
@@ -679,6 +903,33 @@ struct SnapshotDto {
     l: u32,
     halted: bool,
     instruction_counter: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponseEnvelope {
+    #[serde(default)]
+    id: Option<Value>,
+    ok: bool,
+    #[serde(default)]
+    data: Option<Value>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SnapshotResponse {
+    snapshot: SnapshotDto,
+}
+
+#[derive(Debug, Deserialize)]
+struct SerialOutputResponse {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunResponse {
+    stop_reason: String,
+    snapshot: SnapshotDto,
 }
 
 impl From<gbbrain_core::MachineSnapshot> for SnapshotDto {
@@ -709,7 +960,7 @@ struct FrameSummary {
     byte_len: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TraceEntryDto {
     instruction_counter: u64,
     pc: u16,
@@ -723,7 +974,7 @@ struct TraceEntryDto {
     h: u8,
     l: u8,
     sp: u16,
-    stop_reason: &'static str,
+    stop_reason: String,
 }
 
 impl From<TraceEntry> for TraceEntryDto {
@@ -741,7 +992,7 @@ impl From<TraceEntry> for TraceEntryDto {
             h: entry.h,
             l: entry.l,
             sp: entry.sp,
-            stop_reason: stop_reason_name(entry.stop_reason),
+            stop_reason: stop_reason_name(entry.stop_reason).to_string(),
         }
     }
 }
@@ -782,6 +1033,9 @@ fn memory_region_name(region: MemoryRegion) -> &'static str {
 fn parse_breakpoint(kind: &str, address: u32) -> Result<Breakpoint, String> {
     match kind {
         "pc" => Ok(Breakpoint::ProgramCounter(address)),
+        "opcode" => u8::try_from(address)
+            .map(Breakpoint::Opcode)
+            .map_err(|_| format!("opcode breakpoint out of range: {address}")),
         "memory_read" => Ok(Breakpoint::MemoryRead(address)),
         "memory_write" => Ok(Breakpoint::MemoryWrite(address)),
         _ => Err(format!("unsupported breakpoint kind: {kind}")),
