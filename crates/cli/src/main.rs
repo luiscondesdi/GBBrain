@@ -277,7 +277,8 @@ fn discover_mooneye_dmg_roms() -> Vec<PathBuf> {
 }
 
 fn run_dmg_test_rom(path: &Path) -> SuiteResult {
-    const STEP_LIMIT: usize = 2_000_000;
+    const MOONEYE_STEP_LIMIT: usize = 2_000_000;
+    const BLARGG_STEP_LIMIT: usize = 25_000_000;
     const RUN_CHUNK: u64 = 4_096;
     const HALT_SPIN_LIMIT: usize = 50_000;
 
@@ -303,6 +304,11 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     let is_mooneye = path
         .components()
         .any(|component| component.as_os_str() == "mooneye");
+    let step_limit = if is_mooneye {
+        MOONEYE_STEP_LIMIT
+    } else {
+        BLARGG_STEP_LIMIT
+    };
     if is_mooneye {
         if let Err(error) = client.add_breakpoint("opcode", 0x40) {
             return SuiteResult {
@@ -315,7 +321,7 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
 
     let mut executed = 0_usize;
     let mut halt_spins = 0_usize;
-    while executed < STEP_LIMIT {
+    while executed < step_limit {
         let serial_output = match client.serial_output() {
             Ok(serial_output) => serial_output,
             Err(error) => {
@@ -342,7 +348,7 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
             };
         }
 
-        let remaining = STEP_LIMIT - executed;
+        let remaining = step_limit - executed;
         let batch = remaining.min(RUN_CHUNK as usize) as u64;
         match client.run(batch) {
             Ok(outcome) => {

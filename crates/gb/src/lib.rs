@@ -45,6 +45,14 @@ const INTERRUPT_VECTORS: &[(u8, u16)] = &[
     (0x10, 0x0060),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bus {
+    External,
+    Internal,
+    ExternalVideo,
+    InternalVideo,
+}
+
 #[derive(Debug, Clone)]
 pub enum GbError {
     EmptyRom,
@@ -213,7 +221,11 @@ pub struct GbMachine {
     ppu_cycle_counter: u16,
     dma_source: u16,
     dma_delay_cycles: u16,
+    dma_pending_source: Option<u16>,
+    dma_pending_delay_cycles: u16,
     dma_cycles_remaining: u16,
+    dma_byte_cycles: u8,
+    dma_next_byte: u16,
     pending_watchpoint: Option<WatchpointHit>,
     trace: VecDeque<TraceEntry>,
     serial_output: Vec<u8>,
@@ -251,7 +263,11 @@ impl GbMachine {
             ppu_cycle_counter: 0,
             dma_source: 0,
             dma_delay_cycles: 0,
+            dma_pending_source: None,
+            dma_pending_delay_cycles: 0,
             dma_cycles_remaining: 0,
+            dma_byte_cycles: 0,
+            dma_next_byte: 0,
             pending_watchpoint: None,
             trace: VecDeque::with_capacity(TRACE_CAPACITY),
             serial_output: Vec::new(),
@@ -285,7 +301,11 @@ impl GbMachine {
         self.ppu_cycle_counter = 0;
         self.dma_source = 0;
         self.dma_delay_cycles = 0;
+        self.dma_pending_source = None;
+        self.dma_pending_delay_cycles = 0;
         self.dma_cycles_remaining = 0;
+        self.dma_byte_cycles = 0;
+        self.dma_next_byte = 0;
         self.pending_watchpoint = None;
         self.trace.clear();
         self.serial_output.clear();
@@ -343,13 +363,44 @@ impl GbMachine {
         }
     }
 
+    fn cpu_bus(address: u16) -> Bus {
+        match address {
+            0x0000..=ROM_BANK_N_END | 0xA000..=0xBFFF | WRAM_START..=WRAM_END | ECHO_START..=ECHO_END => Bus::External,
+            VRAM_START..=VRAM_END => Bus::ExternalVideo,
+            OAM_START..=OAM_END => Bus::InternalVideo,
+            _ => Bus::Internal,
+        }
+    }
+
+    fn dma_source_bus(&self) -> Option<Bus> {
+        if !self.dma_active() {
+            return None;
+        }
+        let high = (self.dma_source >> 8) as u8;
+        Some(match high {
+            0x80..=0x9F => Bus::ExternalVideo,
+            _ => Bus::External,
+        })
+    }
+
+    fn dma_blocks_cpu_access(&self, address: u16) -> bool {
+        let cpu_bus = Self::cpu_bus(address);
+        if cpu_bus == Bus::InternalVideo {
+            return self.dma_active();
+        }
+        matches!(self.dma_source_bus(), Some(source_bus) if source_bus == cpu_bus)
+    }
+
     fn read8(&mut self, address: u16) -> u8 {
         self.record_watchpoint(WatchpointKind::Read, address);
+        if self.dma_blocks_cpu_access(address) {
+            return 0xFF;
+        }
         self.peek8(address)
     }
 
     fn peek8(&self, address: u16) -> u8 {
-        if self.dma_active() && (OAM_START..=OAM_END).contains(&address) {
+        if self.dma_blocks_cpu_access(address) {
             return 0xFF;
         }
         match address {
@@ -370,6 +421,9 @@ impl GbMachine {
 
     fn write8(&mut self, address: u16, value: u8) {
         self.record_watchpoint(WatchpointKind::Write, address);
+        if self.dma_blocks_cpu_access(address) {
+            return;
+        }
         match address {
             0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize] = value,
             VRAM_START..=VRAM_END => self.vram[(address - VRAM_START) as usize] = value,
@@ -391,6 +445,14 @@ impl GbMachine {
         self.dma_delay_cycles == 0 && self.dma_cycles_remaining > 0
     }
 
+    fn begin_dma(&mut self, source: u16, delay_cycles: u16) {
+        self.dma_source = source;
+        self.dma_delay_cycles = delay_cycles;
+        self.dma_cycles_remaining = 640;
+        self.dma_byte_cycles = 0;
+        self.dma_next_byte = 0;
+    }
+
     fn dma_source_byte(&self, address: u16) -> u8 {
         match address {
             0x0000..=ROM_BANK_0_END | 0x4000..=ROM_BANK_N_END => {
@@ -400,10 +462,12 @@ impl GbMachine {
             0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize],
             0xC000..=0xDFFF => self.wram[(address - 0xC000) as usize],
             0xE000..=0xFDFF => self.wram[(address - 0xE000) as usize],
-            0xFE00..=0xFE9F => self.oam[(address - 0xFE00) as usize],
-            0xFF80..=0xFFFE => self.hram[(address - 0xFF80) as usize],
-            0xFFFF => self.ie,
-            _ => 0xFF,
+            // OAM DMA does not use the CPU's usual FE/FF decoding; these ranges source from the
+            // external bus instead, which makes them mirror the WRAM echo area on DMG.
+            0xFE00..=0xFFFF => {
+                let external_address = address.wrapping_sub(0x2000);
+                self.dma_source_byte(external_address)
+            }
         }
     }
 
@@ -437,9 +501,15 @@ impl GbMachine {
             }
             DMA_REGISTER => {
                 self.io[(address - IO_START) as usize] = value;
-                self.dma_source = u16::from(value) << 8;
-                self.dma_delay_cycles = 8;
-                self.dma_cycles_remaining = 640;
+                let source = u16::from(value) << 8;
+                if self.dma_active() {
+                    self.dma_pending_source = Some(source);
+                    self.dma_pending_delay_cycles = 8;
+                } else {
+                    self.dma_pending_source = None;
+                    self.dma_pending_delay_cycles = 0;
+                    self.begin_dma(source, 8);
+                }
             }
             TIMER_TAC => {
                 let old_signal = self.timer_signal();
@@ -482,6 +552,23 @@ impl GbMachine {
         lo | (hi << 8)
     }
 
+    fn fetch8_timed_late(&mut self) -> u8 {
+        self.tick_timers(4);
+        let value = self.read8(self.registers.pc);
+        if self.halt_bug {
+            self.halt_bug = false;
+        } else {
+            self.registers.pc = self.registers.pc.wrapping_add(1);
+        }
+        value
+    }
+
+    fn fetch16_timed_late(&mut self) -> u16 {
+        let lo = u16::from(self.fetch8_timed_late());
+        let hi = u16::from(self.fetch8_timed_late());
+        lo | (hi << 8)
+    }
+
     fn read_r8(&mut self, index: u8) -> u8 {
         match index {
             0 => self.registers.b,
@@ -494,6 +581,16 @@ impl GbMachine {
             7 => self.registers.a,
             _ => 0xFF,
         }
+    }
+
+    fn read_hl_timed_late(&mut self) -> u8 {
+        self.tick_timers(4);
+        self.read8(self.registers.hl())
+    }
+
+    fn write_hl_timed_late(&mut self, value: u8) {
+        self.tick_timers(4);
+        self.write8(self.registers.hl(), value);
     }
 
     fn write_r8(&mut self, index: u8, value: u8) {
@@ -690,123 +787,207 @@ impl GbMachine {
         match opcode {
             0x00..=0x07 => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry = value & 0x80 != 0;
                 let result = value.rotate_left(1);
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x08..=0x0F => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry = value & 0x01 != 0;
                 let result = value.rotate_right(1);
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x10..=0x17 => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry_in = u8::from(self.flag_c());
                 let carry_out = value & 0x80 != 0;
                 let result = (value << 1) | carry_in;
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x18..=0x1F => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry_in = if self.flag_c() { 0x80 } else { 0 };
                 let carry_out = value & 0x01 != 0;
                 let result = (value >> 1) | carry_in;
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x20..=0x27 => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry = value & 0x80 != 0;
                 let result = value << 1;
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x28..=0x2F => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry = value & 0x01 != 0;
                 let result = (value >> 1) | (value & 0x80);
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x30..=0x37 => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let result = value.rotate_left(4);
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, false);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x38..=0x3F => {
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 let carry = value & 0x01 != 0;
                 let result = value >> 1;
-                self.write_r8(target, result);
+                if target == 6 {
+                    self.write_hl_timed_late(result);
+                } else {
+                    self.write_r8(target, result);
+                }
                 self.set_flag(0x80, result == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 16 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x40..=0x7F => {
                 let bit = (opcode - 0x40) / 8;
                 let target = opcode & 0x07;
-                let value = self.read_r8(target);
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                };
                 self.set_flag(0x80, value & (1 << bit) == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, true);
-                Ok(if target == 6 { 12 } else { 8 })
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0x80..=0xBF => {
                 let bit = (opcode - 0x80) / 8;
                 let target = opcode & 0x07;
-                let value = self.read_r8(target) & !(1 << bit);
-                self.write_r8(target, value);
-                Ok(if target == 6 { 16 } else { 8 })
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                } & !(1 << bit);
+                if target == 6 {
+                    self.write_hl_timed_late(value);
+                } else {
+                    self.write_r8(target, value);
+                }
+                Ok(if target == 6 { 8 } else { 8 })
             }
             0xC0..=0xFF => {
                 let bit = (opcode - 0xC0) / 8;
                 let target = opcode & 0x07;
-                let value = self.read_r8(target) | (1 << bit);
-                self.write_r8(target, value);
-                Ok(if target == 6 { 16 } else { 8 })
+                let value = if target == 6 {
+                    self.read_hl_timed_late()
+                } else {
+                    self.read_r8(target)
+                } | (1 << bit);
+                if target == 6 {
+                    self.write_hl_timed_late(value);
+                } else {
+                    self.write_r8(target, value);
+                }
+                Ok(if target == 6 { 8 } else { 8 })
             }
         }
     }
@@ -814,8 +995,10 @@ impl GbMachine {
     fn push16(&mut self, value: u16) -> Result<(), GbError> {
         let hi = (value >> 8) as u8;
         let lo = value as u8;
+        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.write8(self.registers.sp, hi);
+        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.write8(self.registers.sp, lo);
         Ok(())
@@ -823,8 +1006,10 @@ impl GbMachine {
 
     fn pop16(&mut self) -> u16 {
         let lo = u16::from(self.read8(self.registers.sp));
+        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_add(1);
         let hi = u16::from(self.read8(self.registers.sp));
+        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_add(1);
         lo | (hi << 8)
     }
@@ -910,6 +1095,13 @@ impl GbMachine {
         self.ie & self.io[(IF_REGISTER - IO_START) as usize] & 0x1F
     }
 
+    fn highest_priority_interrupt(pending: u8) -> Option<(u8, u16)> {
+        INTERRUPT_VECTORS
+            .iter()
+            .copied()
+            .find(|(mask, _)| pending & mask != 0)
+    }
+
     fn service_interrupt(&mut self) -> Result<bool, GbError> {
         let pending = self.pending_interrupts();
         if pending == 0 {
@@ -920,35 +1112,62 @@ impl GbMachine {
             return Ok(false);
         }
 
-        for (mask, vector) in INTERRUPT_VECTORS {
-            if pending & mask != 0 {
-                self.ime = false;
-                let index = (IF_REGISTER - IO_START) as usize;
-                self.io[index] = (self.io[index] & !mask) | 0xE0;
-                let pc = self.registers.pc;
-                self.push16(pc)?;
-                self.registers.pc = *vector;
-                self.tick_timers(20);
-                return Ok(true);
-            }
+        if Self::highest_priority_interrupt(pending).is_none() {
+            return Ok(false);
         }
 
-        Ok(false)
+        self.ime = false;
+        let pc = self.registers.pc;
+        let hi = (pc >> 8) as u8;
+        let lo = pc as u8;
+
+        self.tick_timers(8);
+
+        self.tick_timers(4);
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.write8(self.registers.sp, hi);
+
+        let pending_after_hi = self.pending_interrupts();
+        let Some((selected_mask, vector)) = Self::highest_priority_interrupt(pending_after_hi) else {
+            self.registers.pc = 0x0000;
+            return Ok(true);
+        };
+
+        self.tick_timers(4);
+        self.registers.sp = self.registers.sp.wrapping_sub(1);
+        self.write8(self.registers.sp, lo);
+
+        let index = (IF_REGISTER - IO_START) as usize;
+        self.io[index] = (self.io[index] & !selected_mask) | 0xE0;
+        self.registers.pc = vector;
+        self.tick_timers(4);
+        Ok(true)
     }
 
     fn tick_timers(&mut self, cycles: u16) {
         self.cycle_counter += u64::from(cycles);
         for _ in 0..cycles {
+            if let Some(source) = self.dma_pending_source {
+                self.dma_pending_delay_cycles -= 1;
+                if self.dma_pending_delay_cycles == 0 {
+                    self.dma_pending_source = None;
+                    self.begin_dma(source, 0);
+                }
+            }
+
             self.step_timer_cycle();
             self.step_ppu_cycle();
             if self.dma_delay_cycles > 0 {
                 self.dma_delay_cycles -= 1;
             } else if self.dma_cycles_remaining > 0 {
                 self.dma_cycles_remaining -= 1;
-                if self.dma_cycles_remaining == 0 {
-                    for i in 0..0xA0u16 {
-                        self.oam[i as usize] =
-                            self.dma_source_byte(self.dma_source.wrapping_add(i));
+                self.dma_byte_cycles = self.dma_byte_cycles.wrapping_add(1);
+                if self.dma_byte_cycles == 4 {
+                    self.dma_byte_cycles = 0;
+                    if self.dma_next_byte < 0xA0 {
+                        self.oam[self.dma_next_byte as usize] =
+                            self.dma_source_byte(self.dma_source.wrapping_add(self.dma_next_byte));
+                        self.dma_next_byte += 1;
                     }
                 }
             }
@@ -1245,18 +1464,18 @@ impl GbMachine {
                 8
             }
             0x34 => {
-                let address = self.registers.hl();
-                let value = self.read8(address);
+                let value = self.read8(self.registers.hl());
                 let result = self.inc8(value);
-                self.write8(address, result);
-                12
+                self.tick_timers(4);
+                self.write8(self.registers.hl(), result);
+                4
             }
             0x35 => {
-                let address = self.registers.hl();
-                let value = self.read8(address);
+                let value = self.read8(self.registers.hl());
                 let result = self.dec8(value);
-                self.write8(address, result);
-                12
+                self.tick_timers(4);
+                self.write8(self.registers.hl(), result);
+                4
             }
             0x30 => {
                 if !self.flag_c() {
@@ -1318,8 +1537,8 @@ impl GbMachine {
             }
             0x36 => {
                 let value = self.fetch8();
-                self.write8(self.registers.hl(), value);
-                12
+                self.write_hl_timed_late(value);
+                8
             }
             0x40..=0x7F if opcode != 0x76 => {
                 let dst = (opcode >> 3) & 0x07;
@@ -1356,37 +1575,45 @@ impl GbMachine {
             0xC1 => {
                 let value = self.pop16();
                 self.registers.set_bc(value);
-                12
+                4
             }
             0xC0 => {
                 if self.condition_true(0) {
+                    self.tick_timers(8);
                     self.registers.pc = self.pop16();
-                    20
+                    self.tick_timers(4);
+                    0
                 } else {
                     8
                 }
             }
             0xCB => self.execute_cb_prefixed()?,
             0xC9 => {
+                self.tick_timers(4);
                 self.registers.pc = self.pop16();
-                16
+                self.tick_timers(4);
+                0
             }
             0xC3 => {
-                self.registers.pc = self.fetch16();
-                16
+                let address = self.fetch16_timed_late();
+                self.tick_timers(4);
+                self.registers.pc = address;
+                4
             }
             0xC2 => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(0) {
                     self.registers.pc = address;
-                    16
+                    self.tick_timers(4);
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xC5 => {
+                self.tick_timers(4);
                 self.push16(self.registers.bc())?;
-                16
+                4
             }
             0xC6 => {
                 let value = self.fetch8();
@@ -1394,47 +1621,53 @@ impl GbMachine {
                 8
             }
             0xC4 => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(0) {
+                    self.tick_timers(4);
                     self.push16(self.registers.pc)?;
                     self.registers.pc = address;
-                    24
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xC8 => {
                 if self.condition_true(1) {
+                    self.tick_timers(8);
                     self.registers.pc = self.pop16();
-                    20
+                    self.tick_timers(4);
+                    0
                 } else {
                     8
                 }
             }
             0xCA => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(1) {
                     self.registers.pc = address;
-                    16
+                    self.tick_timers(4);
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xCC => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(1) {
+                    self.tick_timers(4);
                     self.push16(self.registers.pc)?;
                     self.registers.pc = address;
-                    24
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xCD => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = address;
-                24
+                4
             }
             0xCE => {
                 let value = self.fetch8();
@@ -1442,59 +1675,68 @@ impl GbMachine {
                 8
             }
             0xC7 => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0000;
-                16
+                4
             }
             0xCF => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0008;
-                16
+                4
             }
             0xD7 => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0010;
-                16
+                4
             }
             0xDF => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0018;
-                16
+                4
             }
             0xD1 => {
                 let value = self.pop16();
                 self.registers.set_de(value);
-                12
+                4
             }
             0xD0 => {
                 if self.condition_true(2) {
+                    self.tick_timers(8);
                     self.registers.pc = self.pop16();
-                    20
+                    self.tick_timers(4);
+                    0
                 } else {
                     8
                 }
             }
             0xD5 => {
+                self.tick_timers(4);
                 self.push16(self.registers.de())?;
-                16
+                4
             }
             0xD2 => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(2) {
                     self.registers.pc = address;
-                    16
+                    self.tick_timers(4);
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xD4 => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(2) {
+                    self.tick_timers(4);
                     self.push16(self.registers.pc)?;
                     self.registers.pc = address;
-                    24
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xD6 => {
@@ -1509,56 +1751,60 @@ impl GbMachine {
             }
             0xD8 => {
                 if self.condition_true(3) {
+                    self.tick_timers(8);
                     self.registers.pc = self.pop16();
-                    20
+                    self.tick_timers(4);
+                    0
                 } else {
                     8
                 }
             }
             0xDA => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(3) {
                     self.registers.pc = address;
-                    16
+                    self.tick_timers(4);
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xDC => {
-                let address = self.fetch16();
+                let address = self.fetch16_timed_late();
                 if self.condition_true(3) {
+                    self.tick_timers(4);
                     self.push16(self.registers.pc)?;
                     self.registers.pc = address;
-                    24
+                    4
                 } else {
-                    12
+                    4
                 }
             }
             0xEA => {
                 let address = self.fetch16();
-                self.tick_timers(12);
+                self.tick_timers(8);
                 self.write8(address, self.registers.a);
                 4
             }
             0xE0 => {
                 let offset = self.fetch8();
-                self.tick_timers(8);
+                self.tick_timers(4);
                 self.write8(0xFF00 | u16::from(offset), self.registers.a);
                 4
             }
             0xE2 => {
-                self.tick_timers(4);
                 self.write8(0xFF00 | u16::from(self.registers.c), self.registers.a);
-                4
+                8
             }
             0xE1 => {
                 let value = self.pop16();
                 self.registers.set_hl(value);
-                12
+                4
             }
             0xE5 => {
+                self.tick_timers(4);
                 self.push16(self.registers.hl())?;
-                16
+                4
             }
             0xE6 => {
                 let value = self.fetch8();
@@ -1566,23 +1812,26 @@ impl GbMachine {
                 8
             }
             0xE7 => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0020;
-                16
+                4
             }
             0xE8 => {
-                let offset = self.fetch8() as i8;
+                let offset = self.fetch8_timed_late() as i8;
+                self.tick_timers(8);
                 self.registers.sp = self.add_sp_signed(offset);
-                16
+                4
             }
             0xE9 => {
                 self.registers.pc = self.registers.hl();
                 4
             }
             0xEF => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0028;
-                16
+                4
             }
             0xF6 => {
                 let value = self.fetch8();
@@ -1596,26 +1845,27 @@ impl GbMachine {
             }
             0xFA => {
                 let address = self.fetch16();
-                self.tick_timers(12);
+                self.tick_timers(8);
                 self.registers.a = self.read8(address);
                 4
             }
             0xF0 => {
                 let offset = self.fetch8();
-                self.tick_timers(8);
+                self.tick_timers(4);
                 self.registers.a = self.read8(0xFF00 | u16::from(offset));
                 4
             }
             0xF1 => {
                 let value = self.pop16();
                 self.registers.set_af(value);
-                12
+                4
             }
             0xF8 => {
-                let offset = self.fetch8() as i8;
+                let offset = self.fetch8_timed_late() as i8;
+                self.tick_timers(4);
                 let value = self.add_sp_signed(offset);
                 self.registers.set_hl(value);
-                12
+                4
             }
             0xF9 => {
                 self.registers.sp = self.registers.hl();
@@ -1627,18 +1877,19 @@ impl GbMachine {
                 4
             }
             0xF2 => {
-                self.tick_timers(4);
                 self.registers.a = self.read8(0xFF00 | u16::from(self.registers.c));
-                4
+                8
             }
             0xF5 => {
+                self.tick_timers(4);
                 self.push16(self.registers.af())?;
-                16
+                4
             }
             0xF7 => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0030;
-                16
+                4
             }
             0xFE => {
                 let value = self.fetch8();
@@ -1646,19 +1897,22 @@ impl GbMachine {
                 8
             }
             0xFF => {
+                self.tick_timers(4);
                 self.push16(self.registers.pc)?;
                 self.registers.pc = 0x0038;
-                16
+                4
             }
             0xFB => {
                 self.ime_enable_delay = 2;
                 4
             }
             0xD9 => {
+                self.tick_timers(4);
                 self.registers.pc = self.pop16();
+                self.tick_timers(4);
                 self.ime = true;
                 self.ime_enable_delay = 0;
-                16
+                0
             }
             0x08 => {
                 let address = self.fetch16();
