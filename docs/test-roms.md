@@ -37,3 +37,10 @@ For the current DMG bootstrap, prioritize:
 - Mooneye `acceptance`
 
 These should become the baseline external validation suites for CPU and memory behavior as the emulator core expands.
+
+## Platform Scope Notes
+
+- DMG is the active bring-up target until the baseline CPU, timer, interrupt, DMA, and PPU behavior is reliable.
+- CGB-only validation should be deferred, not discarded, while the machine still runs in DMG mode only.
+- When CGB bring-up starts, re-enable CGB-targeted suites and cases that were intentionally skipped during DMG-only work.
+- GBA remains in scope, but only after the GB/CGB debugging surface and hardware model are strong enough to reuse the same agent workflow.

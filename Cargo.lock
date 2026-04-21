@@ -28,6 +28,8 @@ name = "gbbrain-gb"
 version = "0.1.0"
 dependencies = [
  "gbbrain-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

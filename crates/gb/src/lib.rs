@@ -6,6 +6,7 @@ use gbbrain_core::{
     AddressSpace, Breakpoint, CpuRegisters, FrameBuffer, Machine, MachineControl, MachineSnapshot,
     MemoryRegion, RenderTarget, RunResult, StopReason,
 };
+use serde::{Deserialize, Serialize};
 
 const ROM_BANK_0_END: u16 = 0x3FFF;
 const ROM_BANK_N_END: u16 = 0x7FFF;
@@ -53,6 +54,19 @@ enum Bus {
     InternalVideo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OamCorruptionKind {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum TimaReloadState {
+    OverflowDelay(u8),
+    ReloadWindow(u8),
+}
+
 #[derive(Debug, Clone)]
 pub enum GbError {
     EmptyRom,
@@ -77,6 +91,7 @@ impl fmt::Display for GbError {
 impl Error for GbError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize)]
 struct Registers {
     a: u8,
     f: u8,
@@ -144,12 +159,14 @@ impl Registers {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 enum WatchpointKind {
     Read,
     Write,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
 struct WatchpointHit {
     kind: WatchpointKind,
     address: u16,
@@ -198,6 +215,114 @@ impl TraceEntry {
     }
 }
 
+impl From<Breakpoint> for SnapshotBreakpoint {
+    fn from(value: Breakpoint) -> Self {
+        match value {
+            Breakpoint::ProgramCounter(v) => Self::ProgramCounter(v),
+            Breakpoint::Opcode(v) => Self::Opcode(v),
+            Breakpoint::MemoryRead(v) => Self::MemoryRead(v),
+            Breakpoint::MemoryWrite(v) => Self::MemoryWrite(v),
+        }
+    }
+}
+
+impl From<SnapshotBreakpoint> for Breakpoint {
+    fn from(value: SnapshotBreakpoint) -> Self {
+        match value {
+            SnapshotBreakpoint::ProgramCounter(v) => Self::ProgramCounter(v),
+            SnapshotBreakpoint::Opcode(v) => Self::Opcode(v),
+            SnapshotBreakpoint::MemoryRead(v) => Self::MemoryRead(v),
+            SnapshotBreakpoint::MemoryWrite(v) => Self::MemoryWrite(v),
+        }
+    }
+}
+
+impl From<TraceEntry> for SnapshotTraceEntry {
+    fn from(value: TraceEntry) -> Self {
+        Self {
+            instruction_counter: value.instruction_counter,
+            pc: value.pc,
+            opcode: value.opcode,
+            a: value.a,
+            f: value.f,
+            b: value.b,
+            c: value.c,
+            d: value.d,
+            e: value.e,
+            h: value.h,
+            l: value.l,
+            sp: value.sp,
+            stop_reason: match value.stop_reason {
+                StopReason::StepComplete => 0,
+                StopReason::BreakpointHit => 1,
+                StopReason::WatchpointHit => 2,
+                StopReason::Halted => 3,
+                StopReason::FrameComplete => 4,
+                StopReason::RunLimitReached => 5,
+            },
+        }
+    }
+}
+
+impl From<SnapshotTraceEntry> for TraceEntry {
+    fn from(value: SnapshotTraceEntry) -> Self {
+        Self {
+            instruction_counter: value.instruction_counter,
+            pc: value.pc,
+            opcode: value.opcode,
+            a: value.a,
+            f: value.f,
+            b: value.b,
+            c: value.c,
+            d: value.d,
+            e: value.e,
+            h: value.h,
+            l: value.l,
+            sp: value.sp,
+            stop_reason: match value.stop_reason {
+                0 => StopReason::StepComplete,
+                1 => StopReason::BreakpointHit,
+                2 => StopReason::WatchpointHit,
+                3 => StopReason::Halted,
+                4 => StopReason::FrameComplete,
+                _ => StopReason::RunLimitReached,
+            },
+        }
+    }
+}
+
+fn r8_name(index: u8) -> &'static str {
+    match index {
+        0 => "B",
+        1 => "C",
+        2 => "D",
+        3 => "E",
+        4 => "H",
+        5 => "L",
+        6 => "(HL)",
+        7 => "A",
+        _ => "?",
+    }
+}
+
+fn cb_name(opcode: u8) -> String {
+    let target = r8_name(opcode & 0x07);
+    let bit = (opcode >> 3) & 0x07;
+    match opcode {
+        0x00..=0x07 => format!("RLC {target}"),
+        0x08..=0x0F => format!("RRC {target}"),
+        0x10..=0x17 => format!("RL {target}"),
+        0x18..=0x1F => format!("RR {target}"),
+        0x20..=0x27 => format!("SLA {target}"),
+        0x28..=0x2F => format!("SRA {target}"),
+        0x30..=0x37 => format!("SWAP {target}"),
+        0x38..=0x3F => format!("SRL {target}"),
+        0x40..=0x7F => format!("BIT {bit},{target}"),
+        0x80..=0xBF => format!("RES {bit},{target}"),
+        _ => format!("SET {bit},{target}"),
+    }
+}
+
 /// Minimal DMG machine with a stable control and inspection surface.
 pub struct GbMachine {
     rom: Vec<u8>,
@@ -217,7 +342,7 @@ pub struct GbMachine {
     instruction_counter: u64,
     cycle_counter: u64,
     div_counter: u16,
-    tima_reload_delay: Option<u8>,
+    tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
     dma_source: u16,
     dma_delay_cycles: u16,
@@ -229,6 +354,85 @@ pub struct GbMachine {
     pending_watchpoint: Option<WatchpointHit>,
     trace: VecDeque<TraceEntry>,
     serial_output: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DebugState {
+    pub cycle_counter: u64,
+    pub div_counter: u16,
+    pub ppu_cycle_counter: u16,
+    pub ime: bool,
+    pub ie: u8,
+    pub if_reg: u8,
+    pub lcdc: u8,
+    pub stat: u8,
+    pub ly: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotState {
+    rom: Vec<u8>,
+    eram: Vec<u8>,
+    vram: Vec<u8>,
+    wram: Vec<u8>,
+    oam: Vec<u8>,
+    io: Vec<u8>,
+    hram: Vec<u8>,
+    ie: u8,
+    registers: Registers,
+    breakpoints: Vec<SnapshotBreakpoint>,
+    ime: bool,
+    ime_enable_delay: u8,
+    halted: bool,
+    halt_bug: bool,
+    instruction_counter: u64,
+    cycle_counter: u64,
+    div_counter: u16,
+    tima_reload_state: Option<TimaReloadState>,
+    ppu_cycle_counter: u16,
+    dma_source: u16,
+    dma_delay_cycles: u16,
+    dma_pending_source: Option<u16>,
+    dma_pending_delay_cycles: u16,
+    dma_cycles_remaining: u16,
+    dma_byte_cycles: u8,
+    dma_next_byte: u16,
+    pending_watchpoint: Option<WatchpointHit>,
+    trace: Vec<SnapshotTraceEntry>,
+    serial_output: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum SnapshotBreakpoint {
+    ProgramCounter(u32),
+    Opcode(u8),
+    MemoryRead(u32),
+    MemoryWrite(u32),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisassembledInstruction {
+    pub address: u16,
+    pub bytes: Vec<u8>,
+    pub text: String,
+    pub len: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotTraceEntry {
+    instruction_counter: u64,
+    pc: u16,
+    opcode: u8,
+    a: u8,
+    f: u8,
+    b: u8,
+    c: u8,
+    d: u8,
+    e: u8,
+    h: u8,
+    l: u8,
+    sp: u16,
+    stop_reason: u8,
 }
 
 impl GbMachine {
@@ -259,7 +463,7 @@ impl GbMachine {
             instruction_counter: 0,
             cycle_counter: 0,
             div_counter: 0,
-            tima_reload_delay: None,
+            tima_reload_state: None,
             ppu_cycle_counter: 0,
             dma_source: 0,
             dma_delay_cycles: 0,
@@ -281,13 +485,20 @@ impl GbMachine {
         self.vram.fill(0);
         self.wram.fill(0);
         self.oam.fill(0);
-        self.io.fill(0);
+        self.io.fill(0xFF);
         self.hram.fill(0);
         self.ie = 0;
         self.registers = Registers {
+            a: 0x01,
+            f: 0xB0,
+            b: 0x00,
+            c: 0x13,
+            d: 0x00,
+            e: 0xD8,
+            h: 0x01,
+            l: 0x4D,
             sp: 0xFFFE,
             pc: 0x0100,
-            ..Registers::default()
         };
         self.breakpoints.clear();
         self.ime = false;
@@ -296,8 +507,8 @@ impl GbMachine {
         self.halt_bug = false;
         self.instruction_counter = 0;
         self.cycle_counter = 0;
-        self.div_counter = 0;
-        self.tima_reload_delay = None;
+        self.div_counter = 0xABD0;
+        self.tima_reload_state = None;
         self.ppu_cycle_counter = 0;
         self.dma_source = 0;
         self.dma_delay_cycles = 0;
@@ -309,9 +520,48 @@ impl GbMachine {
         self.pending_watchpoint = None;
         self.trace.clear();
         self.serial_output.clear();
+        self.io[0x00] = 0xCF; // P1
+        self.io[(SERIAL_SB - IO_START) as usize] = 0x00;
+        self.io[(SERIAL_SC - IO_START) as usize] = 0x7E;
+        self.io[(TIMER_DIV - IO_START) as usize] = 0xAB;
+        self.io[(TIMER_TIMA - IO_START) as usize] = 0x00;
+        self.io[(TIMER_TMA - IO_START) as usize] = 0x00;
+        self.io[(TIMER_TAC - IO_START) as usize] = 0xF8;
+        self.io[(IF_REGISTER - IO_START) as usize] = 0xE1;
+        self.io[0x10] = 0x80; // NR10
+        self.io[0x11] = 0xBF; // NR11
+        self.io[0x12] = 0xF3; // NR12
+        self.io[0x13] = 0xFF; // NR13
+        self.io[0x14] = 0xBF; // NR14
+        self.io[0x16] = 0x3F; // NR21
+        self.io[0x17] = 0x00; // NR22
+        self.io[0x18] = 0xFF; // NR23
+        self.io[0x19] = 0xBF; // NR24
+        self.io[0x1A] = 0x7F; // NR30
+        self.io[0x1B] = 0xFF; // NR31
+        self.io[0x1C] = 0x9F; // NR32
+        self.io[0x1D] = 0xFF; // NR33
+        self.io[0x1E] = 0xBF; // NR34
+        self.io[0x20] = 0xFF; // NR41
+        self.io[0x21] = 0x00; // NR42
+        self.io[0x22] = 0x00; // NR43
+        self.io[0x23] = 0xBF; // NR44
+        self.io[0x24] = 0x77; // NR50
+        self.io[0x25] = 0xF3; // NR51
+        self.io[0x26] = 0xF1; // NR52
         self.io[(LCDC_REGISTER - IO_START) as usize] = 0x91;
-        self.io[(STAT_REGISTER - IO_START) as usize] = 0x85;
+        self.io[(STAT_REGISTER - IO_START) as usize] = 0x80;
+        self.io[0x42] = 0x00; // SCY
+        self.io[0x43] = 0x00; // SCX
         self.io[(LY_REGISTER - IO_START) as usize] = 0x00;
+        self.io[0x45] = 0x00; // LYC
+        self.io[(DMA_REGISTER - IO_START) as usize] = 0xFF;
+        self.io[0x47] = 0xFC; // BGP
+        self.io[0x48] = 0xFF; // OBP0
+        self.io[0x49] = 0xFF; // OBP1
+        self.io[0x4A] = 0x00; // WY
+        self.io[0x4B] = 0x00; // WX
+        self.refresh_stat();
     }
 
     pub fn trace_entries(&self) -> Vec<TraceEntry> {
@@ -328,6 +578,187 @@ impl GbMachine {
 
     pub fn clear_serial_output(&mut self) {
         self.serial_output.clear();
+    }
+
+    pub fn last_watchpoint(&self) -> Option<(&'static str, u16)> {
+        self.pending_watchpoint.map(|hit| {
+            let kind = match hit.kind {
+                WatchpointKind::Read => "read",
+                WatchpointKind::Write => "write",
+            };
+            (kind, hit.address)
+        })
+    }
+
+    pub fn debug_state(&self) -> DebugState {
+        DebugState {
+            cycle_counter: self.cycle_counter,
+            div_counter: self.div_counter,
+            ppu_cycle_counter: self.ppu_cycle_counter,
+            ime: self.ime,
+            ie: self.ie,
+            if_reg: self.io[(IF_REGISTER - IO_START) as usize],
+            lcdc: self.io[(LCDC_REGISTER - IO_START) as usize],
+            stat: self.io[(STAT_REGISTER - IO_START) as usize],
+            ly: self.io[(LY_REGISTER - IO_START) as usize],
+        }
+    }
+
+    pub fn save_state(&self) -> Result<Vec<u8>, GbError> {
+        let state = SnapshotState {
+            rom: self.rom.clone(),
+            eram: self.eram.to_vec(),
+            vram: self.vram.to_vec(),
+            wram: self.wram.to_vec(),
+            oam: self.oam.to_vec(),
+            io: self.io.to_vec(),
+            hram: self.hram.to_vec(),
+            ie: self.ie,
+            registers: self.registers,
+            breakpoints: self
+                .breakpoints
+                .iter()
+                .copied()
+                .map(SnapshotBreakpoint::from)
+                .collect(),
+            ime: self.ime,
+            ime_enable_delay: self.ime_enable_delay,
+            halted: self.halted,
+            halt_bug: self.halt_bug,
+            instruction_counter: self.instruction_counter,
+            cycle_counter: self.cycle_counter,
+            div_counter: self.div_counter,
+            tima_reload_state: self.tima_reload_state,
+            ppu_cycle_counter: self.ppu_cycle_counter,
+            dma_source: self.dma_source,
+            dma_delay_cycles: self.dma_delay_cycles,
+            dma_pending_source: self.dma_pending_source,
+            dma_pending_delay_cycles: self.dma_pending_delay_cycles,
+            dma_cycles_remaining: self.dma_cycles_remaining,
+            dma_byte_cycles: self.dma_byte_cycles,
+            dma_next_byte: self.dma_next_byte,
+            pending_watchpoint: self.pending_watchpoint,
+            trace: self.trace.iter().copied().map(SnapshotTraceEntry::from).collect(),
+            serial_output: self.serial_output.clone(),
+        };
+
+        serde_json::to_vec(&state).map_err(|_| GbError::StackOverflow(0))
+    }
+
+    pub fn load_state(bytes: &[u8]) -> Result<Self, GbError> {
+        let state: SnapshotState =
+            serde_json::from_slice(bytes).map_err(|_| GbError::StackOverflow(0))?;
+        if state.rom.is_empty() {
+            return Err(GbError::EmptyRom);
+        }
+
+        let mut machine = Self::new(state.rom)?;
+        machine.eram.copy_from_slice(&state.eram[..0x2000]);
+        machine.vram.copy_from_slice(&state.vram[..0x2000]);
+        machine.wram.copy_from_slice(&state.wram[..0x2000]);
+        machine.oam.copy_from_slice(&state.oam[..0xA0]);
+        machine.io.copy_from_slice(&state.io[..0x80]);
+        machine.hram.copy_from_slice(&state.hram[..0x7F]);
+        machine.ie = state.ie;
+        machine.registers = state.registers;
+        machine.breakpoints = state.breakpoints.into_iter().map(Breakpoint::from).collect();
+        machine.ime = state.ime;
+        machine.ime_enable_delay = state.ime_enable_delay;
+        machine.halted = state.halted;
+        machine.halt_bug = state.halt_bug;
+        machine.instruction_counter = state.instruction_counter;
+        machine.cycle_counter = state.cycle_counter;
+        machine.div_counter = state.div_counter;
+        machine.tima_reload_state = state.tima_reload_state;
+        machine.ppu_cycle_counter = state.ppu_cycle_counter;
+        machine.dma_source = state.dma_source;
+        machine.dma_delay_cycles = state.dma_delay_cycles;
+        machine.dma_pending_source = state.dma_pending_source;
+        machine.dma_pending_delay_cycles = state.dma_pending_delay_cycles;
+        machine.dma_cycles_remaining = state.dma_cycles_remaining;
+        machine.dma_byte_cycles = state.dma_byte_cycles;
+        machine.dma_next_byte = state.dma_next_byte;
+        machine.pending_watchpoint = state.pending_watchpoint;
+        machine.trace = state.trace.into_iter().map(TraceEntry::from).collect();
+        machine.serial_output = state.serial_output;
+        machine.refresh_stat();
+        Ok(machine)
+    }
+
+    pub fn disassemble_range(&self, start: u16, count: usize) -> Vec<DisassembledInstruction> {
+        let mut out = Vec::with_capacity(count);
+        let mut pc = start;
+        for _ in 0..count {
+            let inst = self.disassemble_one(pc);
+            pc = pc.wrapping_add(u16::from(inst.len.max(1)));
+            out.push(inst);
+        }
+        out
+    }
+
+    fn disassemble_one(&self, address: u16) -> DisassembledInstruction {
+        let opcode = self.peek8(address);
+        let b1 = self.peek8(address.wrapping_add(1));
+        let b2 = self.peek8(address.wrapping_add(2));
+        let word = u16::from_le_bytes([b1, b2]);
+        let (len, text) = match opcode {
+            0x00 => (1, "NOP".to_string()),
+            0x01 => (3, format!("LD BC,${word:04X}")),
+            0x03 => (1, "INC BC".to_string()),
+            0x04 => (1, "INC B".to_string()),
+            0x05 => (1, "DEC B".to_string()),
+            0x06 => (2, format!("LD B,${b1:02X}")),
+            0x0D => (1, "DEC C".to_string()),
+            0x0E => (2, format!("LD C,${b1:02X}")),
+            0x11 => (3, format!("LD DE,${word:04X}")),
+            0x13 => (1, "INC DE".to_string()),
+            0x18 => (2, format!("JR {:+}", b1 as i8)),
+            0x20 => (2, format!("JR NZ,{:+}", b1 as i8)),
+            0x21 => (3, format!("LD HL,${word:04X}")),
+            0x22 => (1, "LD (HL+),A".to_string()),
+            0x23 => (1, "INC HL".to_string()),
+            0x28 => (2, format!("JR Z,{:+}", b1 as i8)),
+            0x2A => (1, "LD A,(HL+)".to_string()),
+            0x31 => (3, format!("LD SP,${word:04X}")),
+            0x32 => (1, "LD (HL-),A".to_string()),
+            0x3A => (1, "LD A,(HL-)".to_string()),
+            0x3C => (1, "INC A".to_string()),
+            0x3D => (1, "DEC A".to_string()),
+            0x3E => (2, format!("LD A,${b1:02X}")),
+            0x76 => (1, "HALT".to_string()),
+            0x77 => (1, "LD (HL),A".to_string()),
+            0x78..=0x7F => (1, format!("LD A,{}", r8_name(opcode & 0x07))),
+            0xA8..=0xAF => (1, format!("XOR {}", r8_name(opcode & 0x07))),
+            0xB0..=0xB7 => (1, format!("OR {}", r8_name(opcode & 0x07))),
+            0xC1 => (1, "POP BC".to_string()),
+            0xC3 => (3, format!("JP ${word:04X}")),
+            0xC5 => (1, "PUSH BC".to_string()),
+            0xC9 => (1, "RET".to_string()),
+            0xCD => (3, format!("CALL ${word:04X}")),
+            0xD1 => (1, "POP DE".to_string()),
+            0xD5 => (1, "PUSH DE".to_string()),
+            0xE0 => (2, format!("LDH ($FF{b1:02X}),A")),
+            0xE1 => (1, "POP HL".to_string()),
+            0xE5 => (1, "PUSH HL".to_string()),
+            0xEA => (3, format!("LD (${word:04X}),A")),
+            0xF0 => (2, format!("LDH A,($FF{b1:02X})")),
+            0xF1 => (1, "POP AF".to_string()),
+            0xF3 => (1, "DI".to_string()),
+            0xF5 => (1, "PUSH AF".to_string()),
+            0xFB => (1, "EI".to_string()),
+            0xFE => (2, format!("CP ${b1:02X}")),
+            0xCB => (2, format!("CB {}", cb_name(b1))),
+            _ => (1, format!("DB ${opcode:02X}")),
+        };
+        let bytes = (0..len)
+            .map(|offset| self.peek8(address.wrapping_add(u16::from(offset))))
+            .collect();
+        DisassembledInstruction {
+            address,
+            bytes,
+            text,
+            len,
+        }
     }
 
     fn push_trace(&mut self, entry: TraceEntry) {
@@ -391,12 +822,137 @@ impl GbMachine {
         matches!(self.dma_source_bus(), Some(source_bus) if source_bus == cpu_bus)
     }
 
-    fn read8(&mut self, address: u16) -> u8 {
+    fn lcd_enabled(&self) -> bool {
+        self.io[(LCDC_REGISTER - IO_START) as usize] & 0x80 != 0
+    }
+
+    fn current_ly(&self) -> u8 {
+        self.io[(LY_REGISTER - IO_START) as usize]
+    }
+
+    fn ppu_mode(&self) -> u8 {
+        if !self.lcd_enabled() {
+            return 0;
+        }
+        if self.current_ly() >= 144 {
+            return 1;
+        }
+        if self.ppu_cycle_counter < 80 {
+            2
+        } else if self.ppu_cycle_counter < 252 {
+            3
+        } else {
+            0
+        }
+    }
+
+    fn refresh_stat(&mut self) {
+        let stat_index = (STAT_REGISTER - IO_START) as usize;
+        let lyc_index = (0xFF45 - IO_START) as usize;
+        let ly_equals_lyc = self.io[(LY_REGISTER - IO_START) as usize] == self.io[lyc_index];
+        let mut stat = self.io[stat_index] & 0xF8;
+        if ly_equals_lyc {
+            stat |= 0x04;
+        }
+        stat |= self.ppu_mode() & 0x03;
+        self.io[stat_index] = stat;
+    }
+
+    fn oam_bug_row(&self) -> Option<usize> {
+        if self.ppu_mode() == 2 {
+            Some(usize::from((self.ppu_cycle_counter / 4).min(19)))
+        } else {
+            None
+        }
+    }
+
+    fn oam_bug_applies(address: u16) -> bool {
+        (0xFE00..=0xFEFF).contains(&address)
+    }
+
+    fn oam_word(&self, row: usize, word: usize) -> u16 {
+        let base = row * 8 + word * 2;
+        u16::from_le_bytes([self.oam[base], self.oam[base + 1]])
+    }
+
+    fn set_oam_word(&mut self, row: usize, word: usize, value: u16) {
+        let base = row * 8 + word * 2;
+        let [lo, hi] = value.to_le_bytes();
+        self.oam[base] = lo;
+        self.oam[base + 1] = hi;
+    }
+
+    fn apply_oam_row_corruption(&mut self, row: usize, kind: OamCorruptionKind) {
+        if row == 0 || row >= 20 {
+            return;
+        }
+
+        match kind {
+            OamCorruptionKind::Write => {
+                let a = self.oam_word(row, 0);
+                let b = self.oam_word(row - 1, 0);
+                let c = self.oam_word(row - 1, 2);
+                self.set_oam_word(row, 0, ((a ^ c) & (b ^ c)) ^ c);
+                for word in 1..4 {
+                    self.set_oam_word(row, word, self.oam_word(row - 1, word));
+                }
+            }
+            OamCorruptionKind::Read => {
+                let a = self.oam_word(row, 0);
+                let b = self.oam_word(row - 1, 0);
+                let c = self.oam_word(row - 1, 2);
+                self.set_oam_word(row, 0, b | (a & c));
+                for word in 1..4 {
+                    self.set_oam_word(row, word, self.oam_word(row - 1, word));
+                }
+            }
+            OamCorruptionKind::ReadWrite => {
+                if row >= 4 && row < 19 {
+                    let a = self.oam_word(row - 2, 0);
+                    let b = self.oam_word(row - 1, 0);
+                    let c = self.oam_word(row, 0);
+                    let d = self.oam_word(row - 1, 2);
+                    let corrupted_prev = (b & (a | c | d)) | (a & c & d);
+                    self.set_oam_word(row - 1, 0, corrupted_prev);
+                    for word in 1..4 {
+                        let prev = self.oam_word(row - 1, word);
+                        self.set_oam_word(row, word, prev);
+                        self.set_oam_word(row - 2, word, prev);
+                    }
+                    self.set_oam_word(row, 0, corrupted_prev);
+                    self.set_oam_word(row - 2, 0, corrupted_prev);
+                }
+                self.apply_oam_row_corruption(row, OamCorruptionKind::Read);
+            }
+        }
+    }
+
+    fn maybe_trigger_oam_bug(&mut self, address: u16, kind: OamCorruptionKind) {
+        if !Self::oam_bug_applies(address) {
+            return;
+        }
+        if let Some(row) = self.oam_bug_row() {
+            self.apply_oam_row_corruption(row, kind);
+        }
+    }
+
+    fn read8_with_kind(&mut self, address: u16, kind: OamCorruptionKind) -> u8 {
         self.record_watchpoint(WatchpointKind::Read, address);
+        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
+            self.maybe_trigger_oam_bug(address, kind);
+            return 0xFF;
+        }
+        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
+            return 0xFF;
+        }
         if self.dma_blocks_cpu_access(address) {
             return 0xFF;
         }
         self.peek8(address)
+    }
+
+    fn read8(&mut self, address: u16) -> u8 {
+        self.read8_with_kind(address, OamCorruptionKind::Read)
     }
 
     fn peek8(&self, address: u16) -> u8 {
@@ -421,6 +977,13 @@ impl GbMachine {
 
     fn write8(&mut self, address: u16, value: u8) {
         self.record_watchpoint(WatchpointKind::Write, address);
+        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
+            self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
+            return;
+        }
+        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
+            return;
+        }
         if self.dma_blocks_cpu_access(address) {
             return;
         }
@@ -473,6 +1036,19 @@ impl GbMachine {
 
     fn write_io(&mut self, address: u16, value: u8) {
         match address {
+            LCDC_REGISTER => {
+                let was_enabled = self.lcd_enabled();
+                self.io[(address - IO_START) as usize] = value;
+                let now_enabled = value & 0x80 != 0;
+                if !was_enabled && now_enabled {
+                    self.ppu_cycle_counter = 4;
+                    self.io[(LY_REGISTER - IO_START) as usize] = 0;
+                } else if was_enabled && !now_enabled {
+                    self.ppu_cycle_counter = 0;
+                    self.io[(LY_REGISTER - IO_START) as usize] = 0;
+                }
+                self.refresh_stat();
+            }
             TIMER_DIV => {
                 let old_signal = self.timer_signal();
                 self.div_counter = 0;
@@ -482,17 +1058,20 @@ impl GbMachine {
                 }
             }
             TIMER_TIMA => {
-                if let Some(delay) = self.tima_reload_delay {
-                    if delay <= 4 {
+                match self.tima_reload_state {
+                    Some(TimaReloadState::OverflowDelay(_)) => {
+                        self.tima_reload_state = None;
+                    }
+                    Some(TimaReloadState::ReloadWindow(_)) => {
                         return;
                     }
-                    self.tima_reload_delay = None;
+                    None => {}
                 }
                 self.io[(address - IO_START) as usize] = value;
             }
             TIMER_TMA => {
                 self.io[(address - IO_START) as usize] = value;
-                if matches!(self.tima_reload_delay, Some(delay) if delay <= 4) {
+                if matches!(self.tima_reload_state, Some(TimaReloadState::ReloadWindow(_))) {
                     self.io[(TIMER_TIMA - IO_START) as usize] = value;
                 }
             }
@@ -537,7 +1116,12 @@ impl GbMachine {
     }
 
     fn fetch8(&mut self) -> u8 {
-        let value = self.read8(self.registers.pc);
+        let pc = self.registers.pc;
+        let value = if Self::oam_bug_applies(pc) && self.ppu_mode() == 2 {
+            self.read8_with_kind(pc, OamCorruptionKind::ReadWrite)
+        } else {
+            self.read8(pc)
+        };
         if self.halt_bug {
             self.halt_bug = false;
         } else {
@@ -995,9 +1579,11 @@ impl GbMachine {
     fn push16(&mut self, value: u16) -> Result<(), GbError> {
         let hi = (value >> 8) as u8;
         let lo = value as u8;
+        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.write8(self.registers.sp, hi);
+        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.write8(self.registers.sp, lo);
@@ -1006,6 +1592,7 @@ impl GbMachine {
 
     fn pop16(&mut self) -> u16 {
         let lo = u16::from(self.read8(self.registers.sp));
+        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_add(1);
         let hi = u16::from(self.read8(self.registers.sp));
@@ -1039,7 +1626,7 @@ impl GbMachine {
         self.io[tima_index] = next;
         if overflow {
             self.io[tima_index] = 0;
-            self.tima_reload_delay = Some(9);
+            self.tima_reload_state = Some(TimaReloadState::OverflowDelay(4));
         }
     }
 
@@ -1052,19 +1639,25 @@ impl GbMachine {
             self.increment_tima();
         }
 
-        if let Some(delay) = self.tima_reload_delay {
-            if delay == 6 {
-                self.request_interrupt(0x04);
-            }
-            if delay == 5 {
-                let tma = self.io[(TIMER_TMA - IO_START) as usize];
-                self.io[(TIMER_TIMA - IO_START) as usize] = tma;
-            }
-
-            if delay <= 1 {
-                self.tima_reload_delay = None;
-            } else {
-                self.tima_reload_delay = Some(delay - 1);
+        if let Some(state) = self.tima_reload_state {
+            match state {
+                TimaReloadState::OverflowDelay(remaining) => {
+                    if remaining <= 1 {
+                        let tma = self.io[(TIMER_TMA - IO_START) as usize];
+                        self.io[(TIMER_TIMA - IO_START) as usize] = tma;
+                        self.request_interrupt(0x04);
+                        self.tima_reload_state = Some(TimaReloadState::ReloadWindow(4));
+                    } else {
+                        self.tima_reload_state = Some(TimaReloadState::OverflowDelay(remaining - 1));
+                    }
+                }
+                TimaReloadState::ReloadWindow(remaining) => {
+                    if remaining <= 1 {
+                        self.tima_reload_state = None;
+                    } else {
+                        self.tima_reload_state = Some(TimaReloadState::ReloadWindow(remaining - 1));
+                    }
+                }
             }
         }
     }
@@ -1074,10 +1667,12 @@ impl GbMachine {
         if lcdc & 0x80 == 0 {
             self.ppu_cycle_counter = 0;
             self.io[(LY_REGISTER - IO_START) as usize] = 0;
+            self.refresh_stat();
             return;
         }
 
         self.ppu_cycle_counter = self.ppu_cycle_counter.wrapping_add(1);
+        self.refresh_stat();
         if self.ppu_cycle_counter < 456 {
             return;
         }
@@ -1089,6 +1684,7 @@ impl GbMachine {
         if self.io[ly_index] == 144 {
             self.request_interrupt(0x01);
         }
+        self.refresh_stat();
     }
 
     fn pending_interrupts(&self) -> u8 {
@@ -1238,6 +1834,7 @@ impl GbMachine {
                 8
             }
             0x03 => {
+                self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
                 let value = self.registers.bc().wrapping_add(1);
                 self.registers.set_bc(value);
                 8
@@ -1285,6 +1882,7 @@ impl GbMachine {
                 8
             }
             0x0B => {
+                self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
                 let value = self.registers.bc().wrapping_sub(1);
                 self.registers.set_bc(value);
                 8
@@ -1311,6 +1909,7 @@ impl GbMachine {
                 8
             }
             0x13 => {
+                self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
                 let value = self.registers.de().wrapping_add(1);
                 self.registers.set_de(value);
                 8
@@ -1342,6 +1941,7 @@ impl GbMachine {
                 8
             }
             0x1B => {
+                self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
                 let value = self.registers.de().wrapping_sub(1);
                 self.registers.set_de(value);
                 8
@@ -1396,6 +1996,7 @@ impl GbMachine {
                 8
             }
             0x23 => {
+                self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
                 let value = self.registers.hl().wrapping_add(1);
                 self.registers.set_hl(value);
                 8
@@ -1403,6 +2004,7 @@ impl GbMachine {
             0x22 => {
                 let address = self.registers.hl();
                 self.write8(address, self.registers.a);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_add(1));
                 8
             }
@@ -1420,11 +2022,13 @@ impl GbMachine {
             }
             0x2A => {
                 let address = self.registers.hl();
-                self.registers.a = self.read8(address);
+                self.registers.a = self.read8_with_kind(address, OamCorruptionKind::ReadWrite);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_add(1));
                 8
             }
             0x2B => {
+                self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
                 let value = self.registers.hl().wrapping_sub(1);
                 self.registers.set_hl(value);
                 8
@@ -1452,6 +2056,7 @@ impl GbMachine {
                 12
             }
             0x33 => {
+                self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
                 self.registers.sp = self.registers.sp.wrapping_add(1);
                 8
             }
@@ -1460,6 +2065,7 @@ impl GbMachine {
                 8
             }
             0x3B => {
+                self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
                 self.registers.sp = self.registers.sp.wrapping_sub(1);
                 8
             }
@@ -1468,14 +2074,14 @@ impl GbMachine {
                 let result = self.inc8(value);
                 self.tick_timers(4);
                 self.write8(self.registers.hl(), result);
-                4
+                8
             }
             0x35 => {
                 let value = self.read8(self.registers.hl());
                 let result = self.dec8(value);
                 self.tick_timers(4);
                 self.write8(self.registers.hl(), result);
-                4
+                8
             }
             0x30 => {
                 if !self.flag_c() {
@@ -1510,7 +2116,8 @@ impl GbMachine {
             }
             0x3A => {
                 let address = self.registers.hl();
-                self.registers.a = self.read8(address);
+                self.registers.a = self.read8_with_kind(address, OamCorruptionKind::ReadWrite);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
                 8
             }
@@ -1532,6 +2139,7 @@ impl GbMachine {
             0x32 => {
                 let address = self.registers.hl();
                 self.write8(address, self.registers.a);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
                 8
             }
@@ -1781,16 +2389,14 @@ impl GbMachine {
                 }
             }
             0xEA => {
-                let address = self.fetch16();
-                self.tick_timers(8);
+                let address = self.fetch16_timed_late();
                 self.write8(address, self.registers.a);
-                4
+                8
             }
             0xE0 => {
-                let offset = self.fetch8();
-                self.tick_timers(4);
+                let offset = self.fetch8_timed_late();
                 self.write8(0xFF00 | u16::from(offset), self.registers.a);
-                4
+                8
             }
             0xE2 => {
                 self.write8(0xFF00 | u16::from(self.registers.c), self.registers.a);
@@ -1844,16 +2450,14 @@ impl GbMachine {
                 8
             }
             0xFA => {
-                let address = self.fetch16();
-                self.tick_timers(8);
+                let address = self.fetch16_timed_late();
                 self.registers.a = self.read8(address);
-                4
+                8
             }
             0xF0 => {
-                let offset = self.fetch8();
-                self.tick_timers(4);
+                let offset = self.fetch8_timed_late();
                 self.registers.a = self.read8(0xFF00 | u16::from(offset));
-                4
+                8
             }
             0xF1 => {
                 let value = self.pop16();
@@ -2120,7 +2724,10 @@ impl MachineControl for GbMachine {
 mod tests {
     use gbbrain_core::{Breakpoint, Machine, MachineControl, MemoryRegion, StopReason};
 
-    use super::{GbMachine, IF_REGISTER, TIMER_TAC, TIMER_TIMA, TIMER_TMA};
+    use super::{
+        GbMachine, IF_REGISTER, LCDC_REGISTER, LY_REGISTER, TIMER_DIV, TIMER_TAC, TIMER_TIMA,
+        TIMER_TMA,
+    };
 
     #[test]
     fn step_advances_pc_for_nop() {
@@ -2261,6 +2868,8 @@ mod tests {
     fn timer_overflow_requests_interrupt() {
         let rom = vec![0; 0x200];
         let mut machine = GbMachine::new(rom).unwrap();
+        machine.write8(TIMER_DIV, 0x00);
+        machine.write8(IF_REGISTER, 0x00);
         machine.write8(TIMER_TMA, 0x77);
         machine.write8(TIMER_TIMA, 0xFF);
         machine.write8(TIMER_TAC, 0x05);
@@ -2273,5 +2882,46 @@ mod tests {
 
         assert_eq!(machine.read8(TIMER_TIMA), 0x77);
         assert_ne!(machine.read8(IF_REGISTER) & 0x04, 0);
+    }
+
+    #[test]
+    fn lcd_enable_starts_first_visible_line_on_blargg_window() {
+        let rom = vec![0; 0x200];
+        let mut machine = GbMachine::new(rom).unwrap();
+
+        machine.write8(LCDC_REGISTER, 0x00);
+        machine.write8(LCDC_REGISTER, 0x81);
+        machine.tick_timers(112 * 4);
+        assert_eq!(machine.read8(LY_REGISTER), 0);
+        machine.tick_timers(4);
+        assert_eq!(machine.read8(LY_REGISTER), 1);
+    }
+
+    #[test]
+    #[ignore = "exploratory timing probe for Blargg init_timer; not a stable invariant yet"]
+    fn blargg_init_timer_window_matches_expected_if_edge() {
+        let rom = vec![0; 0x200];
+        let mut machine = GbMachine::new(rom).unwrap();
+
+        machine.ie &= !0x04;
+        machine.write8(TIMER_TMA, 0x00);
+        machine.write8(TIMER_TAC, 0x05);
+        machine.write8(IF_REGISTER, 0x00);
+        machine.write8(TIMER_TIMA, 0xEC);
+
+        machine.tick_timers(70);
+
+        assert_eq!(machine.read8(IF_REGISTER) & 0x04, 0);
+
+        let mut triggered_after = None;
+        for extra in 1..=32 {
+            machine.tick_timers(1);
+            if machine.read8(IF_REGISTER) & 0x04 != 0 {
+                triggered_after = Some(extra);
+                break;
+            }
+        }
+
+        assert_eq!(triggered_after, Some(7));
     }
 }

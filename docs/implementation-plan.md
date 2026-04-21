@@ -110,6 +110,7 @@ Deliverable:
 - VRAM/OAM timing constraints
 - Palette, banking, DMA details
 - CGB double-speed and additional hardware state
+- Reintroduce CGB-only validation paths that were deferred during DMG-focused bring-up
 
 Deliverable:
 
@@ -152,6 +153,13 @@ Deliverable:
 3. Scaffold `gb` crate with CPU state, memory map, and stepping API.
 4. Add a minimal CLI that loads a ROM path and exposes run/step/inspect commands.
 5. Wire baseline test harness for ROM-driven execution and deterministic state assertions.
+
+## Current Sequencing Note
+
+- The active inner loop is still DMG correctness and timing.
+- Some validation paths that require CGB behavior may be skipped temporarily while the machine is DMG-only.
+- Those deferred cases must come back as soon as CGB-specific hardware work starts.
+- GBA work should reuse the same agent-facing control model instead of introducing a separate debugging surface.
 
 ## Open Decisions
 

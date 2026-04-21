@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gbbrain_core::{
     Breakpoint, FrameBuffer, Machine, MachineControl, MemoryRegion, RenderTarget, StopReason,
 };
-use gbbrain_gb::{GbMachine, TraceEntry};
+use gbbrain_gb::{DebugState, DisassembledInstruction, GbMachine, TraceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -236,7 +236,6 @@ fn discover_blargg_dmg_roms() -> Vec<PathBuf> {
         "test-roms/blargg/instr_timing/instr_timing.gb",
         "test-roms/blargg/mem_timing/mem_timing.gb",
         "test-roms/blargg/mem_timing-2/mem_timing.gb",
-        "test-roms/blargg/interrupt_time/interrupt_time.gb",
         "test-roms/blargg/halt_bug.gb",
         "test-roms/blargg/oam_bug/oam_bug.gb",
     ];
@@ -277,8 +276,6 @@ fn discover_mooneye_dmg_roms() -> Vec<PathBuf> {
 }
 
 fn run_dmg_test_rom(path: &Path) -> SuiteResult {
-    const MOONEYE_STEP_LIMIT: usize = 2_000_000;
-    const BLARGG_STEP_LIMIT: usize = 25_000_000;
     const RUN_CHUNK: u64 = 4_096;
     const HALT_SPIN_LIMIT: usize = 50_000;
 
@@ -304,11 +301,6 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     let is_mooneye = path
         .components()
         .any(|component| component.as_os_str() == "mooneye");
-    let step_limit = if is_mooneye {
-        MOONEYE_STEP_LIMIT
-    } else {
-        BLARGG_STEP_LIMIT
-    };
     if is_mooneye {
         if let Err(error) = client.add_breakpoint("opcode", 0x40) {
             return SuiteResult {
@@ -319,9 +311,8 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
         }
     }
 
-    let mut executed = 0_usize;
     let mut halt_spins = 0_usize;
-    while executed < step_limit {
+    loop {
         let serial_output = match client.serial_output() {
             Ok(serial_output) => serial_output,
             Err(error) => {
@@ -348,11 +339,28 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
             };
         }
 
-        let remaining = step_limit - executed;
-        let batch = remaining.min(RUN_CHUNK as usize) as u64;
-        match client.run(batch) {
+        if !is_mooneye {
+            match detect_blargg_ram_result(&mut client) {
+                Ok(Some((status, detail))) => {
+                    return SuiteResult {
+                        status,
+                        detail: Some(detail),
+                        serial_output,
+                    };
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return SuiteResult {
+                        status: SuiteStatus::Error,
+                        detail: Some(error),
+                        serial_output,
+                    };
+                }
+            }
+        }
+
+        match client.run(RUN_CHUNK) {
             Ok(outcome) => {
-                executed = outcome.instruction_counter as usize;
                 if is_mooneye && outcome.stop_reason == "breakpoint_hit" {
                     match client.snapshot() {
                         Ok(snapshot) => {
@@ -403,6 +411,13 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
                     if halt_spins >= HALT_SPIN_LIMIT {
                         break;
                     }
+                    if let Err(error) = client.run_for_cycles(RUN_CHUNK * 4) {
+                        return SuiteResult {
+                            status: SuiteStatus::Error,
+                            detail: Some(error),
+                            serial_output,
+                        };
+                    }
                     continue;
                 }
                 halt_spins = 0;
@@ -419,9 +434,9 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
 
     let serial_output = client.serial_output().unwrap_or_default();
     let detail = if serial_output.is_empty() {
-        "no pass/fail signature before step limit or halt".to_string()
+        "no pass/fail signature before repeated halted state".to_string()
     } else {
-        "execution stopped without recognized pass/fail signature".to_string()
+        "execution stalled after repeated halted state without pass/fail signature".to_string()
     };
 
     SuiteResult {
@@ -429,6 +444,34 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
         detail: Some(detail),
         serial_output,
     }
+}
+
+fn detect_blargg_ram_result(client: &mut StdioSession) -> Result<Option<(SuiteStatus, String)>, String> {
+    let bytes = client.inspect_memory("system", 0xA000, 64)?;
+    if bytes.len() < 4 || bytes[1..4] != [0xDE, 0xB0, 0x61] {
+        return Ok(None);
+    }
+
+    let status = bytes[0];
+    if status == 0x80 {
+        return Ok(None);
+    }
+
+    let text_end = bytes[4..]
+        .iter()
+        .position(|&byte| byte == 0)
+        .map(|index| 4 + index)
+        .unwrap_or(bytes.len());
+    let text = String::from_utf8_lossy(&bytes[4..text_end]).trim().to_string();
+
+    let suite_status = if status == 0 { SuiteStatus::Pass } else { SuiteStatus::Fail };
+    let detail = if text.is_empty() {
+        format!("detected Blargg RAM result code {status}")
+    } else {
+        format!("detected Blargg RAM result code {status}: {text}")
+    };
+
+    Ok(Some((suite_status, detail)))
 }
 
 fn detect_mooneye_result(snapshot: &SnapshotDto) -> Option<SuiteStatus> {
@@ -454,7 +497,6 @@ struct StdioSession {
 
 struct RunOutcome {
     stop_reason: String,
-    instruction_counter: usize,
 }
 
 impl StdioSession {
@@ -510,6 +552,18 @@ impl StdioSession {
             .map_err(|error| format!("invalid serial output response: {error}"))
     }
 
+    fn inspect_memory(&mut self, region: &str, address: u32, len: usize) -> Result<Vec<u8>, String> {
+        let response = self.request(json!({
+            "command": "inspect_memory",
+            "region": region,
+            "address": address,
+            "len": len
+        }))?;
+        serde_json::from_value::<InspectMemoryResponse>(response)
+            .map(|response| response.bytes)
+            .map_err(|error| format!("invalid inspect_memory response: {error}"))
+    }
+
     fn step(&mut self, count: u64) -> Result<String, String> {
         let response = self.request(json!({
             "command": "step",
@@ -518,6 +572,16 @@ impl StdioSession {
         serde_json::from_value::<RunResponse>(response)
             .map(|response| response.stop_reason)
             .map_err(|error| format!("invalid step response: {error}"))
+    }
+
+    fn run_for_cycles(&mut self, cycles: u64) -> Result<String, String> {
+        let response = self.request(json!({
+            "command": "run_for_cycles",
+            "cycles": cycles
+        }))?;
+        serde_json::from_value::<RunResponse>(response)
+            .map(|response| response.stop_reason)
+            .map_err(|error| format!("invalid run_for_cycles response: {error}"))
     }
 
     fn add_breakpoint(&mut self, kind: &str, address: u32) -> Result<(), String> {
@@ -542,7 +606,6 @@ impl StdioSession {
         serde_json::from_value::<RunResponse>(response)
             .map(|response| RunOutcome {
                 stop_reason: response.stop_reason,
-                instruction_counter: response.snapshot.instruction_counter as usize,
             })
             .map_err(|error| format!("invalid run response: {error}"))
     }
@@ -630,6 +693,12 @@ struct SessionState {
 }
 
 impl SessionState {
+    fn snapshot_dto(machine: &GbMachine) -> SnapshotDto {
+        let mut snapshot = SnapshotDto::from(machine.snapshot());
+        snapshot.debug = DebugStateDto::from(machine.debug_state());
+        snapshot
+    }
+
     fn handle(&mut self, request: Request) -> Result<Value, String> {
         match request {
             Request::Ping => Ok(json!({ "message": "pong" })),
@@ -640,9 +709,14 @@ impl SessionState {
                     "load_rom",
                     "reset",
                     "step",
+                    "run_for_cycles",
+                    "run_for_instructions",
                     "run",
                     "snapshot",
                     "inspect_memory",
+                    "disassemble",
+                    "save_snapshot",
+                    "load_snapshot",
                     "add_breakpoint",
                     "clear_breakpoints",
                     "get_trace",
@@ -659,17 +733,22 @@ impl SessionState {
                 let machine = self.machine_mut()?;
                 machine.reset().map_err(|error| error.to_string())?;
                 Ok(json!({
-                    "snapshot": SnapshotDto::from(machine.snapshot())
+                    "snapshot": Self::snapshot_dto(machine)
                 }))
             }
             Request::Step { count } => self.step(count.unwrap_or(1)),
+            Request::RunForCycles { cycles } => self.run_for_cycles(cycles),
+            Request::RunForInstructions { count } => self.run_for_instructions(count),
             Request::Run { max_instructions } => self.run(max_instructions),
             Request::Snapshot => {
                 let machine = self.machine_ref()?;
                 Ok(json!({
-                    "snapshot": SnapshotDto::from(machine.snapshot())
+                    "snapshot": Self::snapshot_dto(machine)
                 }))
             }
+            Request::Disassemble { address, count } => self.disassemble(address, count.unwrap_or(8)),
+            Request::SaveSnapshot => self.save_snapshot(),
+            Request::LoadSnapshot { bytes_base64 } => self.load_snapshot(bytes_base64),
             Request::InspectMemory {
                 region,
                 address,
@@ -703,19 +782,20 @@ impl SessionState {
     fn load_rom(&mut self, path: String) -> Result<Value, String> {
         let rom = fs::read(&path).map_err(|error| format!("failed to read ROM '{path}': {error}"))?;
         let machine = GbMachine::new(rom).map_err(|error| error.to_string())?;
-        let snapshot = machine.snapshot();
         self.machine = Some(machine);
         self.rom_path = Some(PathBuf::from(&path));
+        let snapshot = Self::snapshot_dto(self.machine.as_ref().expect("machine just loaded"));
 
         Ok(json!({
             "platform": "gb",
             "rom_path": path,
-            "snapshot": SnapshotDto::from(snapshot)
+            "snapshot": snapshot
         }))
     }
 
     fn step(&mut self, count: u64) -> Result<Value, String> {
         let machine = self.machine_mut()?;
+        let start_instruction_counter = machine.snapshot().instruction_counter;
         let mut last_reason = StopReason::StepComplete;
 
         for _ in 0..count {
@@ -730,32 +810,67 @@ impl SessionState {
 
         Ok(json!({
             "stop_reason": stop_reason_name(last_reason),
-            "snapshot": SnapshotDto::from(machine.snapshot())
+            "instructions_retired": machine.snapshot().instruction_counter - start_instruction_counter,
+            "watchpoint": machine.last_watchpoint().map(|(kind, address)| json!({
+                "kind": kind,
+                "address": address
+            })),
+            "snapshot": Self::snapshot_dto(machine)
+        }))
+    }
+
+    fn run_for_instructions(&mut self, count: u64) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let start_instruction_counter = machine.snapshot().instruction_counter;
+        let stop_reason = execute_for_instructions(machine, count)?;
+
+        Ok(json!({
+            "stop_reason": stop_reason_name(stop_reason),
+            "instructions_retired": machine.snapshot().instruction_counter - start_instruction_counter,
+            "watchpoint": machine.last_watchpoint().map(|(kind, address)| json!({
+                "kind": kind,
+                "address": address
+            })),
+            "snapshot": Self::snapshot_dto(machine)
+        }))
+    }
+
+    fn run_for_cycles(&mut self, cycles: u64) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let start_instruction_counter = machine.snapshot().instruction_counter;
+        let start_cycle_counter = machine.debug_state().cycle_counter;
+        let stop_reason = execute_for_cycles(machine, cycles)?;
+
+        Ok(json!({
+            "stop_reason": stop_reason,
+            "cycles_elapsed": machine.debug_state().cycle_counter - start_cycle_counter,
+            "instructions_retired": machine.snapshot().instruction_counter - start_instruction_counter,
+            "watchpoint": machine.last_watchpoint().map(|(kind, address)| json!({
+                "kind": kind,
+                "address": address
+            })),
+            "snapshot": Self::snapshot_dto(machine)
         }))
     }
 
     fn run(&mut self, max_instructions: Option<u64>) -> Result<Value, String> {
         let machine = self.machine_mut()?;
+        let start_instruction_counter = machine.snapshot().instruction_counter;
 
         let stop_reason = if let Some(limit) = max_instructions {
-            let mut last_reason = StopReason::StepComplete;
-            for _ in 0..limit {
-                let result = machine
-                    .step_instruction()
-                    .map_err(|error| error.to_string())?;
-                last_reason = result.stop_reason;
-                if result.stop_reason != StopReason::StepComplete {
-                    break;
-                }
-            }
-            last_reason
+            execute_for_instructions(machine, limit)?
         } else {
             machine.run().map_err(|error| error.to_string())?.stop_reason
         };
 
         Ok(json!({
             "stop_reason": stop_reason_name(stop_reason),
-            "snapshot": SnapshotDto::from(machine.snapshot())
+            "instructions_retired": machine.snapshot().instruction_counter - start_instruction_counter,
+            "watchpoint": machine.last_watchpoint().map(|(kind, address)| json!({
+                "kind": kind,
+                "address": address
+            })),
+            "snapshot": Self::snapshot_dto(machine)
         }))
     }
 
@@ -776,6 +891,38 @@ impl SessionState {
             "address": address,
             "len": bytes.len(),
             "bytes": bytes
+        }))
+    }
+
+    fn disassemble(&self, address: u32, count: usize) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        let address = u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
+        let instructions: Vec<DisassemblyDto> = machine
+            .disassemble_range(address, count)
+            .into_iter()
+            .map(DisassemblyDto::from)
+            .collect();
+        Ok(json!({ "instructions": instructions }))
+    }
+
+    fn save_snapshot(&self) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        let bytes = machine.save_state().map_err(|error| error.to_string())?;
+        Ok(json!({
+            "format": "gbbrain.gb.state.v1+json",
+            "bytes_base64": BASE64.encode(bytes)
+        }))
+    }
+
+    fn load_snapshot(&mut self, bytes_base64: String) -> Result<Value, String> {
+        let bytes = BASE64
+            .decode(bytes_base64)
+            .map_err(|error| format!("invalid base64 snapshot: {error}"))?;
+        let machine = GbMachine::load_state(&bytes).map_err(|error| error.to_string())?;
+        self.machine = Some(machine);
+        Ok(json!({
+            "platform": "gb",
+            "snapshot": Self::snapshot_dto(self.machine.as_ref().expect("snapshot just loaded"))
         }))
     }
 
@@ -882,9 +1029,14 @@ enum Request {
     LoadRom { path: String },
     Reset,
     Step { count: Option<u64> },
+    RunForCycles { cycles: u64 },
+    RunForInstructions { count: u64 },
     Run { max_instructions: Option<u64> },
     Snapshot,
     InspectMemory { region: String, address: u32, len: usize },
+    Disassemble { address: u32, count: Option<usize> },
+    SaveSnapshot,
+    LoadSnapshot { bytes_base64: String },
     AddBreakpoint { kind: String, address: u32 },
     ClearBreakpoints,
     GetTrace { limit: Option<usize> },
@@ -909,6 +1061,7 @@ struct SnapshotDto {
     l: u32,
     halted: bool,
     instruction_counter: u64,
+    debug: DebugStateDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -933,9 +1086,24 @@ struct SerialOutputResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct RunResponse {
     stop_reason: String,
+    #[serde(default)]
+    watchpoint: Option<WatchpointResponse>,
     snapshot: SnapshotDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct WatchpointResponse {
+    kind: String,
+    address: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectMemoryResponse {
+    bytes: Vec<u8>,
 }
 
 impl From<gbbrain_core::MachineSnapshot> for SnapshotDto {
@@ -953,6 +1121,36 @@ impl From<gbbrain_core::MachineSnapshot> for SnapshotDto {
             l: snapshot.registers.l,
             halted: snapshot.halted,
             instruction_counter: snapshot.instruction_counter,
+            debug: DebugStateDto::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct DebugStateDto {
+    cycle_counter: u64,
+    div_counter: u16,
+    ppu_cycle_counter: u16,
+    ime: bool,
+    ie: u8,
+    if_reg: u8,
+    lcdc: u8,
+    stat: u8,
+    ly: u8,
+}
+
+impl From<DebugState> for DebugStateDto {
+    fn from(state: DebugState) -> Self {
+        Self {
+            cycle_counter: state.cycle_counter,
+            div_counter: state.div_counter,
+            ppu_cycle_counter: state.ppu_cycle_counter,
+            ime: state.ime,
+            ie: state.ie,
+            if_reg: state.if_reg,
+            lcdc: state.lcdc,
+            stat: state.stat,
+            ly: state.ly,
         }
     }
 }
@@ -983,6 +1181,14 @@ struct TraceEntryDto {
     stop_reason: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct DisassemblyDto {
+    address: u16,
+    bytes: Vec<u8>,
+    text: String,
+    len: u8,
+}
+
 impl From<TraceEntry> for TraceEntryDto {
     fn from(entry: TraceEntry) -> Self {
         Self {
@@ -999,6 +1205,17 @@ impl From<TraceEntry> for TraceEntryDto {
             l: entry.l,
             sp: entry.sp,
             stop_reason: stop_reason_name(entry.stop_reason).to_string(),
+        }
+    }
+}
+
+impl From<DisassembledInstruction> for DisassemblyDto {
+    fn from(value: DisassembledInstruction) -> Self {
+        Self {
+            address: value.address,
+            bytes: value.bytes,
+            text: value.text,
+            len: value.len,
         }
     }
 }
@@ -1042,8 +1259,8 @@ fn parse_breakpoint(kind: &str, address: u32) -> Result<Breakpoint, String> {
         "opcode" => u8::try_from(address)
             .map(Breakpoint::Opcode)
             .map_err(|_| format!("opcode breakpoint out of range: {address}")),
-        "memory_read" => Ok(Breakpoint::MemoryRead(address)),
-        "memory_write" => Ok(Breakpoint::MemoryWrite(address)),
+        "memory_read" | "read" => Ok(Breakpoint::MemoryRead(address)),
+        "memory_write" | "write" => Ok(Breakpoint::MemoryWrite(address)),
         _ => Err(format!("unsupported breakpoint kind: {kind}")),
     }
 }
@@ -1062,6 +1279,34 @@ fn stop_reason_name(reason: StopReason) -> &'static str {
         StopReason::WatchpointHit => "watchpoint_hit",
         StopReason::Halted => "halted",
         StopReason::FrameComplete => "frame_complete",
-        StopReason::RunLimitReached => "run_limit_reached",
+        StopReason::RunLimitReached => "instruction_budget_exhausted",
     }
+}
+
+fn execute_for_instructions(machine: &mut GbMachine, count: u64) -> Result<StopReason, String> {
+    for _ in 0..count {
+        let result = machine
+            .step_instruction()
+            .map_err(|error| error.to_string())?;
+        if result.stop_reason != StopReason::StepComplete {
+            return Ok(result.stop_reason);
+        }
+    }
+    Ok(StopReason::RunLimitReached)
+}
+
+fn execute_for_cycles(machine: &mut GbMachine, cycles: u64) -> Result<&'static str, String> {
+    let start_cycles = machine.debug_state().cycle_counter;
+
+    while machine.debug_state().cycle_counter.saturating_sub(start_cycles) < cycles {
+        let result = machine
+            .step_instruction()
+            .map_err(|error| error.to_string())?;
+        match result.stop_reason {
+            StopReason::StepComplete | StopReason::Halted => {}
+            other => return Ok(stop_reason_name(other)),
+        }
+    }
+
+    Ok("cycle_budget_exhausted")
 }
