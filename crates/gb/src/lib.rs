@@ -1172,9 +1172,19 @@ impl GbMachine {
         self.read8(self.registers.hl())
     }
 
+    fn read8_timed_late(&mut self, address: u16) -> u8 {
+        self.tick_timers(4);
+        self.read8(address)
+    }
+
     fn write_hl_timed_late(&mut self, value: u8) {
         self.tick_timers(4);
         self.write8(self.registers.hl(), value);
+    }
+
+    fn write8_timed_late(&mut self, address: u16, value: u8) {
+        self.tick_timers(4);
+        self.write8(address, value);
     }
 
     fn write_r8(&mut self, index: u8, value: u8) {
@@ -1591,12 +1601,11 @@ impl GbMachine {
     }
 
     fn pop16(&mut self) -> u16 {
+        self.tick_timers(4);
         let lo = u16::from(self.read8(self.registers.sp));
-        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
-        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        let hi = u16::from(self.read8(self.registers.sp));
         self.tick_timers(4);
+        let hi = u16::from(self.read8(self.registers.sp));
         self.registers.sp = self.registers.sp.wrapping_add(1);
         lo | (hi << 8)
     }
@@ -1771,12 +1780,8 @@ impl GbMachine {
     }
 
     fn execute_next_instruction(&mut self) -> Result<RunResult, GbError> {
-        if self.ime_enable_delay > 0 {
-            self.ime_enable_delay -= 1;
-            if self.ime_enable_delay == 0 {
-                self.ime = true;
-            }
-        }
+        let suppress_interrupt_dispatch = self.ime_enable_delay != 0;
+        self.ime_enable_delay = 0;
 
         if self.halted {
             self.tick_timers(4);
@@ -1788,7 +1793,7 @@ impl GbMachine {
             }
 
             self.halted = false;
-            if self.ime && self.service_interrupt()? {
+            if !suppress_interrupt_dispatch && self.ime && self.service_interrupt()? {
                 return Ok(RunResult {
                     stop_reason: StopReason::BreakpointHit,
                 });
@@ -1799,7 +1804,7 @@ impl GbMachine {
             });
         }
 
-        if self.service_interrupt()? {
+        if !suppress_interrupt_dispatch && self.service_interrupt()? {
             return Ok(RunResult {
                 stop_reason: StopReason::BreakpointHit,
             });
@@ -2116,10 +2121,11 @@ impl GbMachine {
             }
             0x3A => {
                 let address = self.registers.hl();
+                self.tick_timers(4);
                 self.registers.a = self.read8_with_kind(address, OamCorruptionKind::ReadWrite);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
-                8
+                4
             }
             0x3C => {
                 self.registers.a = self.inc8(self.registers.a);
@@ -2138,10 +2144,11 @@ impl GbMachine {
             }
             0x32 => {
                 let address = self.registers.hl();
+                self.tick_timers(4);
                 self.write8(address, self.registers.a);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
-                8
+                4
             }
             0x36 => {
                 let value = self.fetch8();
@@ -2151,9 +2158,24 @@ impl GbMachine {
             0x40..=0x7F if opcode != 0x76 => {
                 let dst = (opcode >> 3) & 0x07;
                 let src = opcode & 0x07;
-                let value = self.read_r8(src);
-                self.write_r8(dst, value);
-                if dst == 6 || src == 6 { 8 } else { 4 }
+                match (dst, src) {
+                    (6, 6) => unreachable!("HALT is excluded from this opcode range"),
+                    (6, _) => {
+                        let value = self.read_r8(src);
+                        self.write_hl_timed_late(value);
+                        4
+                    }
+                    (_, 6) => {
+                        let value = self.read_hl_timed_late();
+                        self.write_r8(dst, value);
+                        4
+                    }
+                    _ => {
+                        let value = self.read_r8(src);
+                        self.write_r8(dst, value);
+                        4
+                    }
+                }
             }
             0x80..=0x87 => {
                 let value = self.read_r8(opcode & 0x07);
@@ -2390,13 +2412,13 @@ impl GbMachine {
             }
             0xEA => {
                 let address = self.fetch16_timed_late();
-                self.write8(address, self.registers.a);
-                8
+                self.write8_timed_late(address, self.registers.a);
+                4
             }
             0xE0 => {
                 let offset = self.fetch8_timed_late();
-                self.write8(0xFF00 | u16::from(offset), self.registers.a);
-                8
+                self.write8_timed_late(0xFF00 | u16::from(offset), self.registers.a);
+                4
             }
             0xE2 => {
                 self.write8(0xFF00 | u16::from(self.registers.c), self.registers.a);
@@ -2451,13 +2473,13 @@ impl GbMachine {
             }
             0xFA => {
                 let address = self.fetch16_timed_late();
-                self.registers.a = self.read8(address);
-                8
+                self.registers.a = self.read8_timed_late(address);
+                4
             }
             0xF0 => {
                 let offset = self.fetch8_timed_late();
-                self.registers.a = self.read8(0xFF00 | u16::from(offset));
-                8
+                self.registers.a = self.read8_timed_late(0xFF00 | u16::from(offset));
+                4
             }
             0xF1 => {
                 let value = self.pop16();
@@ -2507,7 +2529,10 @@ impl GbMachine {
                 4
             }
             0xFB => {
-                self.ime_enable_delay = 2;
+                if !self.ime {
+                    self.ime = true;
+                    self.ime_enable_delay = 1;
+                }
                 4
             }
             0xD9 => {
@@ -2553,10 +2578,6 @@ impl GbMachine {
                 4
             }
             0x76 => {
-                if self.ime_enable_delay == 1 {
-                    self.ime = true;
-                    self.ime_enable_delay = 0;
-                }
                 if !self.ime && self.pending_interrupts() != 0 {
                     self.halt_bug = true;
                 } else {
@@ -2804,12 +2825,12 @@ mod tests {
         let mut machine = GbMachine::new(rom).unwrap();
 
         machine.step_instruction().unwrap();
-        assert!(!machine.ime);
-        assert_eq!(machine.ime_enable_delay, 2);
+        assert!(machine.ime);
+        assert_eq!(machine.ime_enable_delay, 1);
 
         machine.step_instruction().unwrap();
-        assert!(!machine.ime);
-        assert_eq!(machine.ime_enable_delay, 1);
+        assert!(machine.ime);
+        assert_eq!(machine.ime_enable_delay, 0);
 
         machine.step_instruction().unwrap();
         assert!(machine.ime);
