@@ -340,9 +340,7 @@ pub struct GbMachine {
     prefetched_opcode: Option<u8>,
     breakpoints: Vec<Breakpoint>,
     ime: bool,
-    ime_enable_delay: u8,
     exec_state: ExecState,
-    halt_bug: bool,
     instruction_counter: u64,
     cycle_counter: u64,
     div_counter: u16,
@@ -388,9 +386,11 @@ struct SnapshotState {
     prefetched_opcode: Option<u8>,
     breakpoints: Vec<SnapshotBreakpoint>,
     ime: bool,
+    #[serde(default)]
     ime_enable_delay: u8,
     exec_state: ExecState,
     halted: bool,
+    #[serde(default)]
     halt_bug: bool,
     instruction_counter: u64,
     cycle_counter: u64,
@@ -447,6 +447,90 @@ enum ExecState {
     InterruptDispatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reg8Id {
+    A,
+    B,
+    C,
+    D,
+    E,
+    H,
+    L,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddrMode8 {
+    Bc,
+    De,
+    Hl,
+    Hli,
+    Hld,
+    Direct,
+    ZeroPageImm,
+    ZeroPageC,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Condition {
+    Nz,
+    Z,
+    Nc,
+    C,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackReg16 {
+    Bc,
+    De,
+    Hl,
+    Af,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reg16Pair {
+    Bc,
+    De,
+    Hl,
+    Sp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccumulatorOp {
+    Rlca,
+    Rrca,
+    Rla,
+    Rra,
+    Daa,
+    Cpl,
+    Scf,
+    Ccf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AluOp8 {
+    Add,
+    Adc,
+    Sub,
+    Sbc,
+    And,
+    Xor,
+    Or,
+    Cp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum In8 {
+    Reg(Reg8Id),
+    Addr(AddrMode8),
+    Imm8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Out8 {
+    Reg(Reg8Id),
+    Addr(AddrMode8),
+}
+
 impl GbMachine {
     pub fn new(rom: Vec<u8>) -> Result<Self, GbError> {
         Self::new_with_model(rom, GbModel::Dmg)
@@ -477,9 +561,7 @@ impl GbMachine {
             prefetched_opcode: None,
             breakpoints: Vec::new(),
             ime: false,
-            ime_enable_delay: 0,
             exec_state: ExecState::Running,
-            halt_bug: false,
             instruction_counter: 0,
             cycle_counter: 0,
             div_counter: 0,
@@ -512,9 +594,7 @@ impl GbMachine {
         self.prefetched_opcode = None;
         self.breakpoints.clear();
         self.ime = false;
-        self.ime_enable_delay = 0;
         self.exec_state = ExecState::Running;
-        self.halt_bug = false;
         self.instruction_counter = 0;
         self.cycle_counter = 0;
         self.div_counter = self.model_boot_div_counter();
@@ -776,10 +856,10 @@ impl GbMachine {
                 .map(SnapshotBreakpoint::from)
                 .collect(),
             ime: self.ime,
-            ime_enable_delay: self.ime_enable_delay,
+            ime_enable_delay: 0,
             exec_state: self.exec_state,
             halted: matches!(self.exec_state, ExecState::Halt),
-            halt_bug: self.halt_bug,
+            halt_bug: false,
             instruction_counter: self.instruction_counter,
             cycle_counter: self.cycle_counter,
             div_counter: self.div_counter,
@@ -819,9 +899,7 @@ impl GbMachine {
         machine.prefetched_opcode = state.prefetched_opcode;
         machine.breakpoints = state.breakpoints.into_iter().map(Breakpoint::from).collect();
         machine.ime = state.ime;
-        machine.ime_enable_delay = state.ime_enable_delay;
         machine.exec_state = if state.halted { ExecState::Halt } else { state.exec_state };
-        machine.halt_bug = state.halt_bug;
         machine.instruction_counter = state.instruction_counter;
         machine.cycle_counter = state.cycle_counter;
         machine.div_counter = state.div_counter;
@@ -1308,11 +1386,7 @@ impl GbMachine {
         } else {
             self.read8(pc)
         };
-        if self.halt_bug {
-            self.halt_bug = false;
-        } else {
-            self.registers.pc = self.registers.pc.wrapping_add(1);
-        }
+        self.registers.pc = self.registers.pc.wrapping_add(1);
         value
     }
 
@@ -1331,17 +1405,33 @@ impl GbMachine {
         registers.as_snapshot()
     }
 
-    fn prefetch_next_cycle(&mut self, address: u16) {
+    fn prefetch_opcode_cycle(&mut self, address: u16, advance_pc: bool, allow_interrupt_dispatch: bool) {
         self.tick_mcycle();
         self.prefetched_pc = Some(address);
         self.prefetched_opcode = Some(self.read8(address));
-        if self.ime && self.ime_enable_delay == 0 && self.pending_interrupts() != 0 {
+        if allow_interrupt_dispatch && self.ime && self.pending_interrupts() != 0 {
             self.registers.pc = address;
             self.set_exec_state(ExecState::InterruptDispatch);
         } else {
-            self.registers.pc = address.wrapping_add(1);
+            self.registers.pc = if advance_pc {
+                address.wrapping_add(1)
+            } else {
+                address
+            };
             self.set_exec_state(ExecState::Running);
         }
+    }
+
+    fn prefetch_next_cycle(&mut self, address: u16) {
+        self.prefetch_opcode_cycle(address, true, true);
+    }
+
+    fn prefetch_no_interrupt_cycle(&mut self, address: u16) {
+        self.prefetch_opcode_cycle(address, true, false);
+    }
+
+    fn prefetch_halt_bug_cycle(&mut self, address: u16) {
+        self.prefetch_opcode_cycle(address, false, false);
     }
 
     fn consume_opcode(&mut self) -> (u16, u8) {
@@ -1361,11 +1451,7 @@ impl GbMachine {
     fn fetch8_cycle(&mut self) -> u8 {
         self.tick_mcycle();
         let value = self.read8(self.registers.pc);
-        if self.halt_bug {
-            self.halt_bug = false;
-        } else {
-            self.registers.pc = self.registers.pc.wrapping_add(1);
-        }
+        self.registers.pc = self.registers.pc.wrapping_add(1);
         value
     }
 
@@ -1389,7 +1475,7 @@ impl GbMachine {
         self.write8(address, value);
     }
 
-    fn read_r8(&mut self, index: u8) -> u8 {
+    fn read_r8_data(&mut self, index: u8) -> u8 {
         match index {
             0 => self.registers.b,
             1 => self.registers.c,
@@ -1403,14 +1489,6 @@ impl GbMachine {
         }
     }
 
-    fn read_r8_operand(&mut self, index: u8) -> u8 {
-        if index == 6 {
-            self.read_cycle(self.registers.hl())
-        } else {
-            self.read_r8(index)
-        }
-    }
-
     fn read_hl_timed_late(&mut self) -> u8 {
         self.read_cycle(self.registers.hl())
     }
@@ -1419,7 +1497,7 @@ impl GbMachine {
         self.write_cycle(self.registers.hl(), value);
     }
 
-    fn write_r8(&mut self, index: u8, value: u8) {
+    fn write_r8_data(&mut self, index: u8, value: u8) {
         match index {
             0 => self.registers.b = value,
             1 => self.registers.c = value,
@@ -1431,6 +1509,140 @@ impl GbMachine {
             7 => self.registers.a = value,
             _ => {}
         }
+    }
+
+    fn read_reg8(&mut self, reg: Reg8Id) -> u8 {
+        match reg {
+            Reg8Id::A => self.registers.a,
+            Reg8Id::B => self.registers.b,
+            Reg8Id::C => self.registers.c,
+            Reg8Id::D => self.registers.d,
+            Reg8Id::E => self.registers.e,
+            Reg8Id::H => self.registers.h,
+            Reg8Id::L => self.registers.l,
+        }
+    }
+
+    fn write_reg8(&mut self, reg: Reg8Id, value: u8) {
+        match reg {
+            Reg8Id::A => self.registers.a = value,
+            Reg8Id::B => self.registers.b = value,
+            Reg8Id::C => self.registers.c = value,
+            Reg8Id::D => self.registers.d = value,
+            Reg8Id::E => self.registers.e = value,
+            Reg8Id::H => self.registers.h = value,
+            Reg8Id::L => self.registers.l = value,
+        }
+    }
+
+    fn read_addr_mode8(&mut self, mode: AddrMode8) -> u8 {
+        match mode {
+            AddrMode8::Bc => self.read_cycle(self.registers.bc()),
+            AddrMode8::De => self.read_cycle(self.registers.de()),
+            AddrMode8::Hl => self.read_cycle(self.registers.hl()),
+            AddrMode8::Hli => {
+                let address = self.registers.hl();
+                let value = self.read_cycle(address);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
+                self.registers.set_hl(address.wrapping_add(1));
+                value
+            }
+            AddrMode8::Hld => {
+                let address = self.registers.hl();
+                let value = self.read_cycle(address);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
+                self.registers.set_hl(address.wrapping_sub(1));
+                value
+            }
+            AddrMode8::Direct => {
+                let address = self.fetch16_timed_late();
+                self.read_cycle(address)
+            }
+            AddrMode8::ZeroPageImm => {
+                let offset = self.fetch8_timed_late();
+                self.read_cycle(0xFF00 | u16::from(offset))
+            }
+            AddrMode8::ZeroPageC => self.read_cycle(0xFF00 | u16::from(self.registers.c)),
+        }
+    }
+
+    fn write_addr_mode8(&mut self, mode: AddrMode8, value: u8) {
+        match mode {
+            AddrMode8::Bc => self.write_cycle(self.registers.bc(), value),
+            AddrMode8::De => self.write_cycle(self.registers.de(), value),
+            AddrMode8::Hl => self.write_cycle(self.registers.hl(), value),
+            AddrMode8::Hli => {
+                let address = self.registers.hl();
+                self.write_cycle(address, value);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
+                self.registers.set_hl(address.wrapping_add(1));
+            }
+            AddrMode8::Hld => {
+                let address = self.registers.hl();
+                self.write_cycle(address, value);
+                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
+                self.registers.set_hl(address.wrapping_sub(1));
+            }
+            AddrMode8::Direct => {
+                let address = self.fetch16_timed_late();
+                self.write_cycle(address, value);
+            }
+            AddrMode8::ZeroPageImm => {
+                let offset = self.fetch8_timed_late();
+                self.write_cycle(0xFF00 | u16::from(offset), value);
+            }
+            AddrMode8::ZeroPageC => self.write_cycle(0xFF00 | u16::from(self.registers.c), value),
+        }
+    }
+
+    fn read_in8(&mut self, operand: In8) -> u8 {
+        match operand {
+            In8::Reg(reg) => self.read_reg8(reg),
+            In8::Addr(mode) => self.read_addr_mode8(mode),
+            In8::Imm8 => self.fetch8_timed_late(),
+        }
+    }
+
+    fn write_out8(&mut self, operand: Out8, value: u8) {
+        match operand {
+            Out8::Reg(reg) => self.write_reg8(reg, value),
+            Out8::Addr(mode) => self.write_addr_mode8(mode, value),
+        }
+    }
+
+    fn exec_load8(&mut self, dst: Out8, src: In8) {
+        let value = self.read_in8(src);
+        self.write_out8(dst, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_inc8(&mut self, operand: Out8) {
+        let value = match operand {
+            Out8::Reg(reg) => self.read_reg8(reg),
+            Out8::Addr(mode) => self.read_addr_mode8(mode),
+        };
+        let result = self.inc8(value);
+        self.write_out8(operand, result);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_dec8(&mut self, operand: Out8) {
+        let value = match operand {
+            Out8::Reg(reg) => self.read_reg8(reg),
+            Out8::Addr(mode) => self.read_addr_mode8(mode),
+        };
+        let result = self.dec8(value);
+        self.write_out8(operand, result);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_alu8<F>(&mut self, src: In8, mut op: F)
+    where
+        F: FnMut(&mut Self, u8),
+    {
+        let value = self.read_in8(src);
+        op(self, value);
+        self.prefetch_next_cycle(self.registers.pc);
     }
 
     fn set_flag(&mut self, mask: u8, enabled: bool) {
@@ -1465,6 +1677,20 @@ impl GbMachine {
         self.set_flag(0x20, ((hl & 0x0FFF) + (value & 0x0FFF)) > 0x0FFF);
         self.set_flag(0x10, (u32::from(hl) + u32::from(value)) > 0xFFFF);
         self.registers.set_hl(result);
+    }
+
+    fn inc_r16(&mut self, value: u16) -> u16 {
+        self.maybe_trigger_oam_bug(value, OamCorruptionKind::Write);
+        let result = value.wrapping_add(1);
+        self.tick_mcycle();
+        result
+    }
+
+    fn dec_r16(&mut self, value: u16) -> u16 {
+        self.maybe_trigger_oam_bug(value, OamCorruptionKind::Write);
+        let result = value.wrapping_sub(1);
+        self.tick_mcycle();
+        result
     }
 
     fn add_sp_signed(&mut self, value: i8) -> u16 {
@@ -1561,13 +1787,106 @@ impl GbMachine {
         self.registers.f & 0x10 != 0
     }
 
-    fn condition_true(&self, code: u8) -> bool {
-        match code {
-            0 => !self.flag_z(),
-            1 => self.flag_z(),
-            2 => !self.flag_c(),
-            3 => self.flag_c(),
-            _ => false,
+    fn condition_true(&self, condition: Condition) -> bool {
+        match condition {
+            Condition::Nz => !self.flag_z(),
+            Condition::Z => self.flag_z(),
+            Condition::Nc => !self.flag_c(),
+            Condition::C => self.flag_c(),
+        }
+    }
+
+    fn decode_condition(bits: u8) -> Condition {
+        match bits & 0x03 {
+            0 => Condition::Nz,
+            1 => Condition::Z,
+            2 => Condition::Nc,
+            _ => Condition::C,
+        }
+    }
+
+    fn read_stack_reg16(&self, reg: StackReg16) -> u16 {
+        match reg {
+            StackReg16::Bc => self.registers.bc(),
+            StackReg16::De => self.registers.de(),
+            StackReg16::Hl => self.registers.hl(),
+            StackReg16::Af => self.registers.af(),
+        }
+    }
+
+    fn write_stack_reg16(&mut self, reg: StackReg16, value: u16) {
+        match reg {
+            StackReg16::Bc => self.registers.set_bc(value),
+            StackReg16::De => self.registers.set_de(value),
+            StackReg16::Hl => self.registers.set_hl(value),
+            StackReg16::Af => self.registers.set_af(value),
+        }
+    }
+
+    fn decode_stack_reg16(bits: u8) -> StackReg16 {
+        match bits & 0x03 {
+            0 => StackReg16::Bc,
+            1 => StackReg16::De,
+            2 => StackReg16::Hl,
+            _ => StackReg16::Af,
+        }
+    }
+
+    fn read_reg16_pair(&self, reg: Reg16Pair) -> u16 {
+        match reg {
+            Reg16Pair::Bc => self.registers.bc(),
+            Reg16Pair::De => self.registers.de(),
+            Reg16Pair::Hl => self.registers.hl(),
+            Reg16Pair::Sp => self.registers.sp,
+        }
+    }
+
+    fn write_reg16_pair(&mut self, reg: Reg16Pair, value: u16) {
+        match reg {
+            Reg16Pair::Bc => self.registers.set_bc(value),
+            Reg16Pair::De => self.registers.set_de(value),
+            Reg16Pair::Hl => self.registers.set_hl(value),
+            Reg16Pair::Sp => self.registers.sp = value,
+        }
+    }
+
+    fn decode_reg16_pair(bits: u8) -> Reg16Pair {
+        match bits & 0x03 {
+            0 => Reg16Pair::Bc,
+            1 => Reg16Pair::De,
+            2 => Reg16Pair::Hl,
+            _ => Reg16Pair::Sp,
+        }
+    }
+
+    fn decode_rst_vector(opcode: u8) -> u16 {
+        u16::from(opcode & 0x38)
+    }
+
+    fn decode_accumulator_op(opcode: u8) -> Option<AccumulatorOp> {
+        match opcode {
+            0x07 => Some(AccumulatorOp::Rlca),
+            0x0F => Some(AccumulatorOp::Rrca),
+            0x17 => Some(AccumulatorOp::Rla),
+            0x1F => Some(AccumulatorOp::Rra),
+            0x27 => Some(AccumulatorOp::Daa),
+            0x2F => Some(AccumulatorOp::Cpl),
+            0x37 => Some(AccumulatorOp::Scf),
+            0x3F => Some(AccumulatorOp::Ccf),
+            _ => None,
+        }
+    }
+
+    fn decode_alu_op(opcode: u8) -> AluOp8 {
+        match (opcode >> 3) & 0x07 {
+            0 => AluOp8::Add,
+            1 => AluOp8::Adc,
+            2 => AluOp8::Sub,
+            3 => AluOp8::Sbc,
+            4 => AluOp8::And,
+            5 => AluOp8::Xor,
+            6 => AluOp8::Or,
+            _ => AluOp8::Cp,
         }
     }
 
@@ -1625,224 +1944,614 @@ impl GbMachine {
         self.tick_mcycle();
     }
 
-    fn execute_cb_prefixed(&mut self) -> Result<u16, GbError> {
+    fn ctrl_ret_cc(&mut self, condition: Condition) {
+        self.tick_mcycle();
+        if self.condition_true(condition) {
+            self.ctrl_ret();
+        }
+    }
+
+    fn ctrl_jp_cc(&mut self, condition: Condition, address: u16) {
+        if self.condition_true(condition) {
+            self.ctrl_jp(address);
+        }
+    }
+
+    fn ctrl_call_cc(&mut self, condition: Condition, address: u16) -> Result<(), GbError> {
+        if self.condition_true(condition) {
+            self.ctrl_call(address)?;
+        }
+        Ok(())
+    }
+
+    fn push_reg16_prefetch(&mut self, value: u16, address: u16) -> Result<(), GbError> {
+        self.tick_mcycle();
+        self.push16(value)?;
+        self.prefetch_next_cycle(address);
+        Ok(())
+    }
+
+    fn pop_reg16_prefetch(&mut self) -> u16 {
+        let value = self.pop16();
+        self.prefetch_next_cycle(self.registers.pc);
+        value
+    }
+
+    fn push_stack_reg16_prefetch(&mut self, reg: StackReg16) -> Result<(), GbError> {
+        self.push_reg16_prefetch(self.read_stack_reg16(reg), self.registers.pc)
+    }
+
+    fn pop_stack_reg16_prefetch(&mut self, reg: StackReg16) {
+        let value = self.pop_reg16_prefetch();
+        self.write_stack_reg16(reg, value);
+    }
+
+    fn rst_to(&mut self, address: u16) -> Result<(), GbError> {
+        self.push_reg16_prefetch(self.registers.pc, address)
+    }
+
+    fn ld_addr16_from_sp(&mut self, address: u16) {
+        self.write_cycle(address, self.registers.sp as u8);
+        self.write_cycle(address.wrapping_add(1), (self.registers.sp >> 8) as u8);
+    }
+
+    fn exec_ret_prefetch(&mut self) {
+        self.ctrl_ret();
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_ret_condition_prefetch(&mut self, condition: Condition) {
+        self.ctrl_ret_cc(condition);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_jp_immediate(&mut self) {
+        let address = self.fetch16_timed_late();
+        self.ctrl_jp(address);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_jp_condition_immediate(&mut self, condition: Condition) {
+        let address = self.fetch16_timed_late();
+        self.ctrl_jp_cc(condition, address);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_call_immediate(&mut self) -> Result<(), GbError> {
+        let address = self.fetch16_timed_late();
+        self.ctrl_call(address)?;
+        self.prefetch_next_cycle(self.registers.pc);
+        Ok(())
+    }
+
+    fn exec_call_condition_immediate(&mut self, condition: Condition) -> Result<(), GbError> {
+        let address = self.fetch16_timed_late();
+        self.ctrl_call_cc(condition, address)?;
+        self.prefetch_next_cycle(self.registers.pc);
+        Ok(())
+    }
+
+    fn exec_reti(&mut self) {
+        self.ctrl_ret();
+        self.ime = true;
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_load16_immediate(&mut self, reg: Reg16Pair) {
+        let value = self.fetch16_timed_late();
+        self.write_reg16_pair(reg, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_inc16(&mut self, reg: Reg16Pair) {
+        let value = self.inc_r16(self.read_reg16_pair(reg));
+        self.write_reg16_pair(reg, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_dec16(&mut self, reg: Reg16Pair) {
+        let value = self.dec_r16(self.read_reg16_pair(reg));
+        self.write_reg16_pair(reg, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_add_hl_reg16(&mut self, reg: Reg16Pair) {
+        self.add16_hl(self.read_reg16_pair(reg));
+        self.tick_mcycle();
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn add_sp_signed_prefetch(&mut self, offset: i8) {
+        self.registers.sp = self.add_sp_signed(offset);
+        self.tick_mcycle();
+        self.tick_mcycle();
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn load_hl_sp_plus_signed_prefetch(&mut self, offset: i8) {
+        let value = self.add_sp_signed(offset);
+        self.registers.set_hl(value);
+        self.tick_mcycle();
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn load_sp_from_hl_prefetch(&mut self) {
+        self.registers.sp = self.registers.hl();
+        self.tick_mcycle();
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn jr_cc_prefetch(&mut self, condition: bool) {
+        let offset = self.fetch8_timed_late() as i8;
+        if condition {
+            self.ctrl_jr(offset);
+        }
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_jr_condition(&mut self, condition: Condition) {
+        self.jr_cc_prefetch(self.condition_true(condition));
+    }
+
+    fn exec_alu_op<F>(&mut self, src: In8, op: F)
+    where
+        F: FnMut(&mut Self, u8),
+    {
+        self.exec_alu8(src, op);
+    }
+
+    fn exec_decoded_alu(&mut self, src: In8, op: AluOp8) {
+        match op {
+            AluOp8::Add => self.exec_alu_op(src, Self::add8),
+            AluOp8::Adc => self.exec_alu_op(src, Self::adc8),
+            AluOp8::Sub => self.exec_alu_op(src, Self::sub8),
+            AluOp8::Sbc => self.exec_alu_op(src, Self::sbc8),
+            AluOp8::And => self.exec_alu_op(src, Self::and8),
+            AluOp8::Xor => self.exec_alu_op(src, Self::xor8),
+            AluOp8::Or => self.exec_alu_op(src, Self::or8),
+            AluOp8::Cp => self.exec_alu_op(src, Self::cp8),
+        }
+    }
+
+    fn rotate_a_left_circular(&mut self) {
+        let carry = self.registers.a & 0x80 != 0;
+        self.registers.a = self.registers.a.rotate_left(1);
+        self.set_flag(0x80, false);
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, carry);
+    }
+
+    fn rotate_a_right_circular(&mut self) {
+        let carry = self.registers.a & 0x01 != 0;
+        self.registers.a = self.registers.a.rotate_right(1);
+        self.set_flag(0x80, false);
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, carry);
+    }
+
+    fn rotate_a_left_through_carry(&mut self) {
+        let carry_in = u8::from(self.flag_c());
+        let carry_out = self.registers.a & 0x80 != 0;
+        self.registers.a = (self.registers.a << 1) | carry_in;
+        self.set_flag(0x80, false);
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, carry_out);
+    }
+
+    fn rotate_a_right_through_carry(&mut self) {
+        let carry_in = if self.flag_c() { 0x80 } else { 0 };
+        let carry_out = self.registers.a & 0x01 != 0;
+        self.registers.a = (self.registers.a >> 1) | carry_in;
+        self.set_flag(0x80, false);
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, carry_out);
+    }
+
+    fn complement_a(&mut self) {
+        self.registers.a = !self.registers.a;
+        self.set_flag(0x40, true);
+        self.set_flag(0x20, true);
+    }
+
+    fn complement_carry_flag(&mut self) {
+        let carry = !self.flag_c();
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, carry);
+    }
+
+    fn set_carry_flag(&mut self) {
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, false);
+        self.set_flag(0x10, true);
+    }
+
+    fn exec_accumulator_op(&mut self, op: AccumulatorOp) {
+        match op {
+            AccumulatorOp::Rlca => self.rotate_a_left_circular(),
+            AccumulatorOp::Rrca => self.rotate_a_right_circular(),
+            AccumulatorOp::Rla => self.rotate_a_left_through_carry(),
+            AccumulatorOp::Rra => self.rotate_a_right_through_carry(),
+            AccumulatorOp::Daa => self.daa(),
+            AccumulatorOp::Cpl => self.complement_a(),
+            AccumulatorOp::Scf => self.set_carry_flag(),
+            AccumulatorOp::Ccf => self.complement_carry_flag(),
+        }
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn cb_read_operand(&mut self, target: u8) -> u8 {
+        if target == 6 {
+            self.read_hl_timed_late()
+        } else {
+            self.read_r8_data(target)
+        }
+    }
+
+    fn cb_write_operand(&mut self, target: u8, value: u8) {
+        if target == 6 {
+            self.write_hl_timed_late(value);
+        } else {
+            self.write_r8_data(target, value);
+        }
+    }
+
+    fn exec_cb_transform<F>(&mut self, target: u8, mut op: F)
+    where
+        F: FnMut(&mut Self, u8) -> u8,
+    {
+        let value = self.cb_read_operand(target);
+        let result = op(self, value);
+        self.cb_write_operand(target, result);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_cb_bit(&mut self, target: u8, bit: u8) {
+        let value = self.cb_read_operand(target);
+        self.set_flag(0x80, value & (1 << bit) == 0);
+        self.set_flag(0x40, false);
+        self.set_flag(0x20, true);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_cb_res(&mut self, target: u8, bit: u8) {
+        let value = self.cb_read_operand(target) & !(1 << bit);
+        self.cb_write_operand(target, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn exec_cb_set(&mut self, target: u8, bit: u8) {
+        let value = self.cb_read_operand(target) | (1 << bit);
+        self.cb_write_operand(target, value);
+        self.prefetch_next_cycle(self.registers.pc);
+    }
+
+    fn decode_r8_in(index: u8) -> In8 {
+        match index {
+            0 => In8::Reg(Reg8Id::B),
+            1 => In8::Reg(Reg8Id::C),
+            2 => In8::Reg(Reg8Id::D),
+            3 => In8::Reg(Reg8Id::E),
+            4 => In8::Reg(Reg8Id::H),
+            5 => In8::Reg(Reg8Id::L),
+            6 => In8::Addr(AddrMode8::Hl),
+            7 => In8::Reg(Reg8Id::A),
+            _ => unreachable!("invalid r8 operand"),
+        }
+    }
+
+    fn decode_r8_out(index: u8) -> Out8 {
+        match index {
+            0 => Out8::Reg(Reg8Id::B),
+            1 => Out8::Reg(Reg8Id::C),
+            2 => Out8::Reg(Reg8Id::D),
+            3 => Out8::Reg(Reg8Id::E),
+            4 => Out8::Reg(Reg8Id::H),
+            5 => Out8::Reg(Reg8Id::L),
+            6 => Out8::Addr(AddrMode8::Hl),
+            7 => Out8::Reg(Reg8Id::A),
+            _ => unreachable!("invalid r8 operand"),
+        }
+    }
+
+    fn execute_cb_prefixed(&mut self) -> Result<(), GbError> {
         let opcode = self.fetch8_timed_late();
+        let target = opcode & 0x07;
         match opcode {
-            0x00..=0x07 => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+            0x00..=0x07 => self.exec_cb_transform(target, |machine, value| {
                 let carry = value & 0x80 != 0;
                 let result = value.rotate_left(1);
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x08..=0x0F => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry);
+                result
+            }),
+            0x08..=0x0F => self.exec_cb_transform(target, |machine, value| {
                 let carry = value & 0x01 != 0;
                 let result = value.rotate_right(1);
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x10..=0x17 => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
-                let carry_in = u8::from(self.flag_c());
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry);
+                result
+            }),
+            0x10..=0x17 => self.exec_cb_transform(target, |machine, value| {
+                let carry_in = u8::from(machine.flag_c());
                 let carry_out = value & 0x80 != 0;
                 let result = (value << 1) | carry_in;
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry_out);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x18..=0x1F => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
-                let carry_in = if self.flag_c() { 0x80 } else { 0 };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry_out);
+                result
+            }),
+            0x18..=0x1F => self.exec_cb_transform(target, |machine, value| {
+                let carry_in = if machine.flag_c() { 0x80 } else { 0 };
                 let carry_out = value & 0x01 != 0;
                 let result = (value >> 1) | carry_in;
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry_out);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x20..=0x27 => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry_out);
+                result
+            }),
+            0x20..=0x27 => self.exec_cb_transform(target, |machine, value| {
                 let carry = value & 0x80 != 0;
                 let result = value << 1;
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x28..=0x2F => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry);
+                result
+            }),
+            0x28..=0x2F => self.exec_cb_transform(target, |machine, value| {
                 let carry = value & 0x01 != 0;
                 let result = (value >> 1) | (value & 0x80);
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x30..=0x37 => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry);
+                result
+            }),
+            0x30..=0x37 => self.exec_cb_transform(target, |machine, value| {
                 let result = value.rotate_left(4);
-                if target == 6 {
-                    self.write_hl_timed_late(result);
-                } else {
-                    self.write_r8(target, result);
-                }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, false);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
-            }
-            0x38..=0x3F => {
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, false);
+                result
+            }),
+            0x38..=0x3F => self.exec_cb_transform(target, |machine, value| {
                 let carry = value & 0x01 != 0;
                 let result = value >> 1;
-                if target == 6 {
-                    self.write_hl_timed_late(result);
+                machine.set_flag(0x80, result == 0);
+                machine.set_flag(0x40, false);
+                machine.set_flag(0x20, false);
+                machine.set_flag(0x10, carry);
+                result
+            }),
+            0x40..=0x7F => self.exec_cb_bit(target, (opcode - 0x40) / 8),
+            0x80..=0xBF => self.exec_cb_res(target, (opcode - 0x80) / 8),
+            0xC0..=0xFF => self.exec_cb_set(target, (opcode - 0xC0) / 8),
+        }
+        Ok(())
+    }
+
+    fn execute_opcode_00_3f(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+        let reg16 = Self::decode_reg16_pair((opcode >> 4) & 0x03);
+        match opcode {
+            0x00 => self.prefetch_next_cycle(self.registers.pc),
+            0x01 => self.exec_load16_immediate(reg16),
+            0x02 => self.exec_load8(Out8::Addr(AddrMode8::Bc), In8::Reg(Reg8Id::A)),
+            0x03 => self.exec_inc16(reg16),
+            0x04 => self.exec_inc8(Out8::Reg(Reg8Id::B)),
+            0x05 => self.exec_dec8(Out8::Reg(Reg8Id::B)),
+            0x06 => self.exec_load8(Out8::Reg(Reg8Id::B), In8::Imm8),
+            0x07 => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x08 => {
+                let address = self.fetch16_timed_late();
+                self.ld_addr16_from_sp(address);
+                self.prefetch_next_cycle(self.registers.pc);
+            }
+            0x09 => self.exec_add_hl_reg16(reg16),
+            0x0A => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::Bc)),
+            0x0B => self.exec_dec16(reg16),
+            0x0C => self.exec_inc8(Out8::Reg(Reg8Id::C)),
+            0x0D => self.exec_dec8(Out8::Reg(Reg8Id::C)),
+            0x0E => self.exec_load8(Out8::Reg(Reg8Id::C), In8::Imm8),
+            0x0F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x11 => self.exec_load16_immediate(reg16),
+            0x12 => self.exec_load8(Out8::Addr(AddrMode8::De), In8::Reg(Reg8Id::A)),
+            0x13 => self.exec_inc16(reg16),
+            0x14 => self.exec_inc8(Out8::Reg(Reg8Id::D)),
+            0x15 => self.exec_dec8(Out8::Reg(Reg8Id::D)),
+            0x16 => self.exec_load8(Out8::Reg(Reg8Id::D), In8::Imm8),
+            0x17 => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x18 => {
+                let offset = self.fetch8_timed_late() as i8;
+                self.ctrl_jr(offset);
+                self.prefetch_next_cycle(self.registers.pc);
+            }
+            0x19 => self.exec_add_hl_reg16(reg16),
+            0x1A => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::De)),
+            0x1B => self.exec_dec16(reg16),
+            0x1C => self.exec_inc8(Out8::Reg(Reg8Id::E)),
+            0x1D => self.exec_dec8(Out8::Reg(Reg8Id::E)),
+            0x1E => self.exec_load8(Out8::Reg(Reg8Id::E), In8::Imm8),
+            0x1F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x20 => self.exec_jr_condition(Self::decode_condition((opcode >> 3) & 0x03)),
+            0x21 => self.exec_load16_immediate(reg16),
+            0x22 => self.exec_load8(Out8::Addr(AddrMode8::Hli), In8::Reg(Reg8Id::A)),
+            0x23 => self.exec_inc16(reg16),
+            0x24 => self.exec_inc8(Out8::Reg(Reg8Id::H)),
+            0x25 => self.exec_dec8(Out8::Reg(Reg8Id::H)),
+            0x26 => self.exec_load8(Out8::Reg(Reg8Id::H), In8::Imm8),
+            0x27 => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x28 => self.exec_jr_condition(Self::decode_condition((opcode >> 3) & 0x03)),
+            0x29 => self.exec_add_hl_reg16(reg16),
+            0x2A => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::Hli)),
+            0x2B => self.exec_dec16(reg16),
+            0x2C => self.exec_inc8(Out8::Reg(Reg8Id::L)),
+            0x2D => self.exec_dec8(Out8::Reg(Reg8Id::L)),
+            0x2E => self.exec_load8(Out8::Reg(Reg8Id::L), In8::Imm8),
+            0x2F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x30 => self.exec_jr_condition(Self::decode_condition((opcode >> 3) & 0x03)),
+            0x31 => self.exec_load16_immediate(reg16),
+            0x32 => self.exec_load8(Out8::Addr(AddrMode8::Hld), In8::Reg(Reg8Id::A)),
+            0x33 => self.exec_inc16(reg16),
+            0x34 => self.exec_inc8(Out8::Addr(AddrMode8::Hl)),
+            0x35 => self.exec_dec8(Out8::Addr(AddrMode8::Hl)),
+            0x36 => self.exec_load8(Out8::Addr(AddrMode8::Hl), In8::Imm8),
+            0x37 => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x38 => self.exec_jr_condition(Self::decode_condition((opcode >> 3) & 0x03)),
+            0x39 => self.exec_add_hl_reg16(reg16),
+            0x3A => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::Hld)),
+            0x3B => self.exec_dec16(reg16),
+            0x3C => self.exec_inc8(Out8::Reg(Reg8Id::A)),
+            0x3D => self.exec_dec8(Out8::Reg(Reg8Id::A)),
+            0x3E => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Imm8),
+            0x3F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            _ => {
+                return Err(GbError::UnsupportedOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_opcode_40_bf(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+        match opcode {
+            0x40..=0x7F if opcode != 0x76 => {
+                let dst = Self::decode_r8_out((opcode >> 3) & 0x07);
+                let src = Self::decode_r8_in(opcode & 0x07);
+                self.exec_load8(dst, src);
+            }
+            0x76 => {
+                if self.pending_interrupts() != 0 {
+                    if self.ime {
+                        self.prefetch_next_cycle(self.registers.pc);
+                    } else {
+                        self.prefetch_halt_bug_cycle(self.registers.pc);
+                    }
                 } else {
-                    self.write_r8(target, result);
+                    self.set_exec_state(ExecState::Halt);
+                    self.tick_mcycle();
                 }
-                self.set_flag(0x80, result == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
             }
-            0x40..=0x7F => {
-                let bit = (opcode - 0x40) / 8;
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                };
-                self.set_flag(0x80, value & (1 << bit) == 0);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, true);
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
+            0x80..=0xBF => self.exec_decoded_alu(Self::decode_r8_in(opcode & 0x07), Self::decode_alu_op(opcode)),
+            _ => {
+                return Err(GbError::UnsupportedOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
             }
-            0x80..=0xBF => {
-                let bit = (opcode - 0x80) / 8;
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                } & !(1 << bit);
-                if target == 6 {
-                    self.write_hl_timed_late(value);
-                } else {
-                    self.write_r8(target, value);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
+        }
+        Ok(())
+    }
+
+    fn execute_opcode_c0_ff(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+        let condition = Self::decode_condition((opcode >> 3) & 0x03);
+        let stack_reg = Self::decode_stack_reg16((opcode >> 4) & 0x03);
+        match opcode {
+            0xC0 => self.exec_ret_condition_prefetch(condition),
+            0xC1 => self.pop_stack_reg16_prefetch(stack_reg),
+            0xC2 => self.exec_jp_condition_immediate(condition),
+            0xC3 => self.exec_jp_immediate(),
+            0xC4 => self.exec_call_condition_immediate(condition)?,
+            0xC5 => self.push_stack_reg16_prefetch(stack_reg)?,
+            0xC6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xC7 => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xC8 => self.exec_ret_condition_prefetch(condition),
+            0xC9 => self.exec_ret_prefetch(),
+            0xCA => self.exec_jp_condition_immediate(condition),
+            0xCB => self.execute_cb_prefixed()?,
+            0xCC => self.exec_call_condition_immediate(condition)?,
+            0xCD => self.exec_call_immediate()?,
+            0xCE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xCF => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xD0 => self.exec_ret_condition_prefetch(condition),
+            0xD1 => self.pop_stack_reg16_prefetch(stack_reg),
+            0xD2 => self.exec_jp_condition_immediate(condition),
+            0xD4 => self.exec_call_condition_immediate(condition)?,
+            0xD5 => self.push_stack_reg16_prefetch(stack_reg)?,
+            0xD6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xD7 => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xD8 => self.exec_ret_condition_prefetch(condition),
+            0xD9 => self.exec_reti(),
+            0xDA => self.exec_jp_condition_immediate(condition),
+            0xDC => self.exec_call_condition_immediate(condition)?,
+            0xDE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xDF => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xE0 => {
+                self.exec_load8(Out8::Addr(AddrMode8::ZeroPageImm), In8::Reg(Reg8Id::A));
             }
-            0xC0..=0xFF => {
-                let bit = (opcode - 0xC0) / 8;
-                let target = opcode & 0x07;
-                let value = if target == 6 {
-                    self.read_hl_timed_late()
-                } else {
-                    self.read_r8(target)
-                } | (1 << bit);
-                if target == 6 {
-                    self.write_hl_timed_late(value);
-                } else {
-                    self.write_r8(target, value);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                Ok(0)
+            0xE1 => self.pop_stack_reg16_prefetch(stack_reg),
+            0xE2 => {
+                self.exec_load8(Out8::Addr(AddrMode8::ZeroPageC), In8::Reg(Reg8Id::A));
             }
+            0xE5 => self.push_stack_reg16_prefetch(stack_reg)?,
+            0xE6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xE7 => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xE8 => {
+                let offset = self.fetch8_timed_late() as i8;
+                self.add_sp_signed_prefetch(offset);
+            }
+            0xE9 => self.prefetch_next_cycle(self.registers.hl()),
+            0xEA => {
+                self.exec_load8(Out8::Addr(AddrMode8::Direct), In8::Reg(Reg8Id::A));
+            }
+            0xEE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xEF => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xF0 => {
+                self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::ZeroPageImm));
+            }
+            0xF1 => self.pop_stack_reg16_prefetch(stack_reg),
+            0xF2 => {
+                self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::ZeroPageC));
+            }
+            0xF3 => {
+                self.ime = false;
+                self.prefetch_no_interrupt_cycle(self.registers.pc);
+            }
+            0xF5 => self.push_stack_reg16_prefetch(stack_reg)?,
+            0xF6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xF7 => self.rst_to(Self::decode_rst_vector(opcode))?,
+            0xF8 => {
+                let offset = self.fetch8_timed_late() as i8;
+                self.load_hl_sp_plus_signed_prefetch(offset);
+            }
+            0xF9 => self.load_sp_from_hl_prefetch(),
+            0xFA => {
+                self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::Direct));
+            }
+            0xFB => {
+                self.prefetch_no_interrupt_cycle(self.registers.pc);
+                self.ime = true;
+            }
+            0xFE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xFF => self.rst_to(Self::decode_rst_vector(opcode))?,
+            _ => {
+                return Err(GbError::UnsupportedOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_opcode(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+        match opcode {
+            0x00..=0x3F => self.execute_opcode_00_3f(opcode, opcode_pc),
+            0x40..=0xBF => self.execute_opcode_40_bf(opcode, opcode_pc),
+            0xC0..=0xFF => self.execute_opcode_c0_ff(opcode, opcode_pc),
         }
     }
 
@@ -2016,9 +2725,6 @@ impl GbMachine {
     }
 
     fn execute_next_instruction(&mut self) -> Result<RunResult, GbError> {
-        let suppress_interrupt_dispatch = self.ime_enable_delay != 0;
-        self.ime_enable_delay = 0;
-
         self.pending_watchpoint = None;
 
         loop {
@@ -2040,7 +2746,7 @@ impl GbMachine {
 
                     self.set_exec_state(ExecState::Running);
                     self.prefetch_next_cycle(self.registers.pc);
-                    if !suppress_interrupt_dispatch && matches!(self.exec_state, ExecState::InterruptDispatch) {
+                    if matches!(self.exec_state, ExecState::InterruptDispatch) {
                         continue;
                     }
 
@@ -2067,872 +2773,9 @@ impl GbMachine {
 
         let (opcode_pc, opcode) = self.consume_opcode();
 
-        let cycles = match opcode {
-            0x00 => {
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x01 => {
-                let value = self.fetch16_timed_late();
-                self.registers.set_bc(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x02 => {
-                self.write_cycle(self.registers.bc(), self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x03 => {
-                self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
-                let value = self.registers.bc().wrapping_add(1);
-                self.registers.set_bc(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x04 => {
-                self.registers.b = self.inc8(self.registers.b);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3E => {
-                self.registers.a = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x05 => {
-                self.registers.b = self.dec8(self.registers.b);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x06 => {
-                self.registers.b = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x07 => {
-                let carry = self.registers.a & 0x80 != 0;
-                self.registers.a = self.registers.a.rotate_left(1);
-                self.set_flag(0x80, false);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0F => {
-                let carry = self.registers.a & 0x01 != 0;
-                self.registers.a = self.registers.a.rotate_right(1);
-                self.set_flag(0x80, false);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x09 => {
-                self.add16_hl(self.registers.bc());
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0A => {
-                self.registers.a = self.read_cycle(self.registers.bc());
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0B => {
-                self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
-                let value = self.registers.bc().wrapping_sub(1);
-                self.registers.set_bc(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0C => {
-                self.registers.c = self.inc8(self.registers.c);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0D => {
-                self.registers.c = self.dec8(self.registers.c);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x0E => {
-                self.registers.c = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x11 => {
-                let value = self.fetch16_timed_late();
-                self.registers.set_de(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x12 => {
-                self.write_cycle(self.registers.de(), self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x13 => {
-                self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
-                let value = self.registers.de().wrapping_add(1);
-                self.registers.set_de(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x14 => {
-                self.registers.d = self.inc8(self.registers.d);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x17 => {
-                let carry_in = u8::from(self.flag_c());
-                let carry_out = self.registers.a & 0x80 != 0;
-                self.registers.a = (self.registers.a << 1) | carry_in;
-                self.set_flag(0x80, false);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry_out);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x15 => {
-                self.registers.d = self.dec8(self.registers.d);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x16 => {
-                self.registers.d = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1A => {
-                self.registers.a = self.read_cycle(self.registers.de());
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1B => {
-                self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
-                let value = self.registers.de().wrapping_sub(1);
-                self.registers.set_de(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1C => {
-                self.registers.e = self.inc8(self.registers.e);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1D => {
-                self.registers.e = self.dec8(self.registers.e);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1E => {
-                self.registers.e = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x18 => {
-                let offset = self.fetch8_timed_late() as i8;
-                self.ctrl_jr(offset);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x1F => {
-                let carry_in = if self.flag_c() { 0x80 } else { 0 };
-                let carry_out = self.registers.a & 0x01 != 0;
-                self.registers.a = (self.registers.a >> 1) | carry_in;
-                self.set_flag(0x80, false);
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry_out);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x19 => {
-                self.add16_hl(self.registers.de());
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x20 => {
-                if !self.flag_z() {
-                    let offset = self.fetch8_timed_late() as i8;
-                    self.ctrl_jr(offset);
-                } else {
-                    self.fetch8_timed_late();
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x21 => {
-                let value = self.fetch16_timed_late();
-                self.registers.set_hl(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x29 => {
-                let hl = self.registers.hl();
-                self.add16_hl(hl);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x23 => {
-                self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
-                let value = self.registers.hl().wrapping_add(1);
-                self.registers.set_hl(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x22 => {
-                let address = self.registers.hl();
-                self.write_cycle(address, self.registers.a);
-                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
-                self.registers.set_hl(address.wrapping_add(1));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x24 => {
-                self.registers.h = self.inc8(self.registers.h);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x25 => {
-                self.registers.h = self.dec8(self.registers.h);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x26 => {
-                self.registers.h = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2A => {
-                let address = self.registers.hl();
-                self.registers.a = self.read_cycle(address);
-                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
-                self.registers.set_hl(address.wrapping_add(1));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2B => {
-                self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
-                let value = self.registers.hl().wrapping_sub(1);
-                self.registers.set_hl(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2F => {
-                self.registers.a = !self.registers.a;
-                self.set_flag(0x40, true);
-                self.set_flag(0x20, true);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2C => {
-                self.registers.l = self.inc8(self.registers.l);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2D => {
-                self.registers.l = self.dec8(self.registers.l);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x2E => {
-                self.registers.l = self.fetch8_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x31 => {
-                self.registers.sp = self.fetch16_timed_late();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x33 => {
-                self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
-                self.registers.sp = self.registers.sp.wrapping_add(1);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x39 => {
-                self.add16_hl(self.registers.sp);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3B => {
-                self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
-                self.registers.sp = self.registers.sp.wrapping_sub(1);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x34 => {
-                let address = self.registers.hl();
-                let value = self.read_cycle(address);
-                let result = self.inc8(value);
-                self.write_cycle(address, result);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x35 => {
-                let address = self.registers.hl();
-                let value = self.read_cycle(address);
-                let result = self.dec8(value);
-                self.write_cycle(address, result);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x30 => {
-                if !self.flag_c() {
-                    let offset = self.fetch8_timed_late() as i8;
-                    self.ctrl_jr(offset);
-                } else {
-                    self.fetch8_timed_late();
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x28 => {
-                if self.flag_z() {
-                    let offset = self.fetch8_timed_late() as i8;
-                    self.ctrl_jr(offset);
-                } else {
-                    self.fetch8_timed_late();
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x27 => {
-                self.daa();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x38 => {
-                if self.flag_c() {
-                    let offset = self.fetch8_timed_late() as i8;
-                    self.ctrl_jr(offset);
-                } else {
-                    self.fetch8_timed_late();
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3A => {
-                let address = self.registers.hl();
-                self.registers.a = self.read_cycle(address);
-                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
-                self.registers.set_hl(address.wrapping_sub(1));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3C => {
-                self.registers.a = self.inc8(self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3D => {
-                self.registers.a = self.dec8(self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x3F => {
-                let carry = !self.flag_c();
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, carry);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x32 => {
-                let address = self.registers.hl();
-                self.write_cycle(address, self.registers.a);
-                self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
-                self.registers.set_hl(address.wrapping_sub(1));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x36 => {
-                let value = self.fetch8_timed_late();
-                self.write_cycle(self.registers.hl(), value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x40..=0x7F if opcode != 0x76 => {
-                let dst = (opcode >> 3) & 0x07;
-                let src = opcode & 0x07;
-                match (dst, src) {
-                    (6, 6) => unreachable!("HALT is excluded from this opcode range"),
-                    (6, _) => {
-                        let value = self.read_r8(src);
-                        self.write_cycle(self.registers.hl(), value);
-                        self.prefetch_next_cycle(self.registers.pc);
-                        0
-                    }
-                    (_, 6) => {
-                        let value = self.read_cycle(self.registers.hl());
-                        self.write_r8(dst, value);
-                        self.prefetch_next_cycle(self.registers.pc);
-                        0
-                    }
-                    _ => {
-                        let value = self.read_r8(src);
-                        self.write_r8(dst, value);
-                        self.prefetch_next_cycle(self.registers.pc);
-                        0
-                    }
-                }
-            }
-            0x80..=0x87 => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.add8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x88..=0x8F => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.adc8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x90..=0x97 => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.sub8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x98..=0x9F => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.sbc8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xAF => {
-                self.registers.a = 0;
-                self.registers.f = 0x80;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC1 => {
-                let value = self.pop16();
-                self.registers.set_bc(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC0 => {
-                if self.condition_true(0) {
-                    self.registers.pc = self.pop16();
-                    self.tick_mcycle();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                } else {
-                    self.tick_mcycle();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                }
-            }
-            0xCB => self.execute_cb_prefixed()?,
-            0xC9 => {
-                self.ctrl_ret();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC3 => {
-                let address = self.fetch16_timed_late();
-                self.ctrl_jp(address);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC2 => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(0) {
-                    self.ctrl_jp(address);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC5 => {
-                self.tick_mcycle();
-                self.push16(self.registers.bc())?;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC6 => {
-                let value = self.fetch8_timed_late();
-                self.add8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC4 => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(0) {
-                    self.ctrl_call(address)?;
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC8 => {
-                if self.condition_true(1) {
-                    self.ctrl_ret();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                } else {
-                    self.tick_mcycle();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                }
-            }
-            0xCA => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(1) {
-                    self.ctrl_jp(address);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xCC => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(1) {
-                    self.ctrl_call(address)?;
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xCD => {
-                let address = self.fetch16_timed_late();
-                self.ctrl_call(address)?;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xCE => {
-                let value = self.fetch8_timed_late();
-                self.adc8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xC7 => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0000);
-                0
-            }
-            0xCF => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0008);
-                0
-            }
-            0xD7 => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0010);
-                0
-            }
-            0xDF => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0018);
-                0
-            }
-            0xD1 => {
-                let value = self.pop16();
-                self.registers.set_de(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD0 => {
-                if self.condition_true(2) {
-                    self.ctrl_ret();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                } else {
-                    self.tick_mcycle();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                }
-            }
-            0xD5 => {
-                self.tick_mcycle();
-                self.push16(self.registers.de())?;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD2 => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(2) {
-                    self.ctrl_jp(address);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD4 => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(2) {
-                    self.ctrl_call(address)?;
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD6 => {
-                let value = self.fetch8_timed_late();
-                self.sub8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xDE => {
-                let value = self.fetch8_timed_late();
-                self.sbc8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD8 => {
-                if self.condition_true(3) {
-                    self.ctrl_ret();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                } else {
-                    self.tick_mcycle();
-                    self.prefetch_next_cycle(self.registers.pc);
-                    0
-                }
-            }
-            0xDA => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(3) {
-                    self.ctrl_jp(address);
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xDC => {
-                let address = self.fetch16_timed_late();
-                if self.condition_true(3) {
-                    self.ctrl_call(address)?;
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xEA => {
-                let address = self.fetch16_timed_late();
-                self.write_cycle(address, self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE0 => {
-                let offset = self.fetch8_timed_late();
-                self.write_cycle(0xFF00 | u16::from(offset), self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE2 => {
-                self.write_cycle(0xFF00 | u16::from(self.registers.c), self.registers.a);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE1 => {
-                let value = self.pop16();
-                self.registers.set_hl(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE5 => {
-                self.tick_mcycle();
-                self.push16(self.registers.hl())?;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE6 => {
-                let value = self.fetch8_timed_late();
-                self.and8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE7 => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0020);
-                0
-            }
-            0xE8 => {
-                let offset = self.fetch8_timed_late() as i8;
-                self.registers.sp = self.add_sp_signed(offset);
-                self.tick_mcycle();
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xE9 => {
-                self.prefetch_next_cycle(self.registers.hl());
-                0
-            }
-            0xEF => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0028);
-                0
-            }
-            0xF6 => {
-                let value = self.fetch8_timed_late();
-                self.or8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xEE => {
-                let value = self.fetch8_timed_late();
-                self.xor8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xFA => {
-                let address = self.fetch16_timed_late();
-                self.registers.a = self.read_cycle(address);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF0 => {
-                let offset = self.fetch8_timed_late();
-                self.registers.a = self.read_cycle(0xFF00 | u16::from(offset));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF1 => {
-                let value = self.pop16();
-                self.registers.set_af(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF8 => {
-                let offset = self.fetch8_timed_late() as i8;
-                let value = self.add_sp_signed(offset);
-                self.registers.set_hl(value);
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF9 => {
-                self.registers.sp = self.registers.hl();
-                self.tick_mcycle();
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF3 => {
-                self.ime = false;
-                self.ime_enable_delay = 0;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF2 => {
-                self.registers.a = self.read_cycle(0xFF00 | u16::from(self.registers.c));
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF5 => {
-                self.tick_mcycle();
-                self.push16(self.registers.af())?;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xF7 => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0030);
-                0
-            }
-            0xFE => {
-                let value = self.fetch8_timed_late();
-                self.cp8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xFF => {
-                self.tick_mcycle();
-                self.push16(self.registers.pc)?;
-                self.prefetch_next_cycle(0x0038);
-                0
-            }
-            0xFB => {
-                if !self.ime {
-                    self.ime = true;
-                    self.ime_enable_delay = 1;
-                }
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xD9 => {
-                self.ctrl_ret();
-                self.ime = true;
-                self.ime_enable_delay = 0;
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x08 => {
-                let address = self.fetch16_timed_late();
-                self.write_cycle(address, self.registers.sp as u8);
-                self.write_cycle(address.wrapping_add(1), (self.registers.sp >> 8) as u8);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xA0..=0xA7 => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.and8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xA8..=0xAE => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.xor8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xB8..=0xBF => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.cp8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0xB0..=0xB7 => {
-                let value = self.read_r8_operand(opcode & 0x07);
-                self.or8(value);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x37 => {
-                self.set_flag(0x40, false);
-                self.set_flag(0x20, false);
-                self.set_flag(0x10, true);
-                self.prefetch_next_cycle(self.registers.pc);
-                0
-            }
-            0x76 => {
-                if !self.ime && self.pending_interrupts() != 0 {
-                    self.halt_bug = true;
-                } else {
-                    self.set_exec_state(ExecState::Halt);
-                    self.tick_mcycle();
-                }
-                0
-            }
-            _ => {
-                return Err(GbError::UnsupportedOpcode {
-                    opcode,
-                    pc: opcode_pc,
-                });
-            }
-        };
+        self.execute_opcode(opcode, opcode_pc)?;
 
         self.instruction_counter += 1;
-        self.tick_timers(cycles);
 
         let stop_reason = if matches!(self.exec_state, ExecState::Halt) {
             StopReason::Halted
@@ -3180,18 +3023,20 @@ mod tests {
         rom[0x102] = 0x00;
 
         let mut machine = GbMachine::new(rom).unwrap();
+        machine.ie = 0x01;
+        machine.request_interrupt(0x01);
 
         machine.step_instruction().unwrap();
         assert!(machine.ime);
-        assert_eq!(machine.ime_enable_delay, 1);
+        assert_eq!(machine.snapshot().registers.pc, 0x0101);
 
         machine.step_instruction().unwrap();
         assert!(machine.ime);
-        assert_eq!(machine.ime_enable_delay, 0);
+        assert_eq!(machine.snapshot().registers.pc, 0x0102);
 
         machine.step_instruction().unwrap();
-        assert!(machine.ime);
-        assert_eq!(machine.ime_enable_delay, 0);
+        assert!(!machine.ime);
+        assert_eq!(machine.snapshot().registers.pc, 0x0040);
     }
 
     #[test]

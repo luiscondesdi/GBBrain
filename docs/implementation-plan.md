@@ -66,6 +66,12 @@ Short-term refactor order:
 4. Rework PPU/LCD/STAT timing around explicit mode transitions rather than coarse LY counters.
 5. Only after the machine model is correct, adapt the debug API where necessary to expose the new behavior cleanly.
 
+Current checkpoint:
+
+- The DMG core already uses explicit cycle helpers and prefetch-aware execution.
+- The opcode engine has been split into range dispatchers and now relies on typed operand/control/register-pair decoders instead of a single large inline execution match.
+- The remaining highest-value engine work is further shrinking those dispatchers and continuing to align hardware-side behavior with the same cycle model, especially in PPU/LCD/STAT and the remaining OAM edge cases.
+
 ### Agent-Facing Surface
 
 The first-class API should support:
