@@ -1,6 +1,6 @@
 # AI Interface
 
-GBBrain exposes an MVP agent control surface over stdio.
+GBBrain exposes a machine-readable control surface over stdio.
 
 Start the server with:
 
@@ -48,13 +48,17 @@ Failed responses:
 
 ### `help`
 
-Returns the current command list.
+Returns the current command list, supported breakpoint kinds, and supported machine models.
 
 ### `load_rom`
 
 ```json
-{"id":2,"command":"load_rom","path":"/absolute/path/to/test.gb"}
+{"id":2,"command":"load_rom","path":"/absolute/path/to/test.gb","model":"dmg"}
 ```
+
+`model` is optional. Supported values are `dmg0`, `dmg`, `mgb`, `sgb`, and `sgb2`.
+
+If omitted, the server defaults to `dmg`.
 
 ### `reset`
 
@@ -66,6 +70,22 @@ Steps one or more instructions. This is the direct single-instruction execution 
 
 ```json
 {"id":3,"command":"step","count":4}
+```
+
+### `run_for_cycles`
+
+Advances execution until either the cycle budget is exhausted or the machine hits a real stop condition.
+
+```json
+{"id":4,"command":"run_for_cycles","cycles":256}
+```
+
+### `run_for_instructions`
+
+Advances execution until either the instruction budget is exhausted or the machine hits a real stop condition.
+
+```json
+{"id":5,"command":"run_for_instructions","count":64}
 ```
 
 ### `run`
@@ -80,12 +100,12 @@ Runs until a stop condition produced by the machine itself:
 The intended usage is to set breakpoints or watchpoints first, then call `run`.
 
 ```json
-{"id":4,"command":"run","max_instructions":1000}
+{"id":6,"command":"run","max_instructions":1000}
 ```
 
 ### `snapshot`
 
-Returns the current CPU register snapshot, halted state, and instruction counter.
+Returns the current CPU register snapshot, halted state, instruction counter, and debug timing state.
 
 ### `inspect_memory`
 
@@ -98,7 +118,47 @@ Valid regions:
 - `system`
 
 ```json
-{"id":5,"command":"inspect_memory","region":"rom","address":256,"len":16}
+{"id":7,"command":"inspect_memory","region":"rom","address":256,"len":16}
+```
+
+### `read_address`
+
+Reads one byte from the system address space.
+
+```json
+{"id":8,"command":"read_address","address":49152}
+```
+
+### `write_address`
+
+Writes one byte into the system address space.
+
+```json
+{"id":9,"command":"write_address","address":49152,"value":66}
+```
+
+### `disassemble`
+
+Returns decoded instructions for an address range.
+
+```json
+{"id":10,"command":"disassemble","address":256,"count":8}
+```
+
+### `save_snapshot`
+
+Serializes the current machine state as base64.
+
+```json
+{"id":11,"command":"save_snapshot"}
+```
+
+### `load_snapshot`
+
+Loads a previously saved machine state from base64.
+
+```json
+{"id":12,"command":"load_snapshot","bytes_base64":"..."}
 ```
 
 ### `add_breakpoint`
@@ -106,11 +166,14 @@ Valid regions:
 Valid kinds:
 
 - `pc`
+- `opcode`
 - `memory_read`
 - `memory_write`
+- `read`
+- `write`
 
 ```json
-{"id":6,"command":"add_breakpoint","kind":"pc","address":257}
+{"id":13,"command":"add_breakpoint","kind":"pc","address":257}
 ```
 
 ### `clear_breakpoints`
@@ -122,7 +185,7 @@ Clears all configured breakpoints and watchpoints.
 Returns recent executed instructions from the in-memory trace buffer.
 
 ```json
-{"id":7,"command":"get_trace","limit":32}
+{"id":14,"command":"get_trace","limit":32}
 ```
 
 ### `clear_trace`
@@ -140,7 +203,7 @@ Valid encodings:
 - `base64`
 
 ```json
-{"id":8,"command":"get_serial_output","encoding":"text"}
+{"id":15,"command":"get_serial_output","encoding":"text"}
 ```
 
 ### `clear_serial_output`
@@ -155,7 +218,7 @@ Valid encodings:
 - `base64`
 
 ```json
-{"id":7,"command":"render_frame","encoding":"summary"}
+{"id":16,"command":"render_frame","encoding":"summary"}
 ```
 
 `base64` returns the full RGBA8 frame buffer inline. `summary` returns only metadata.
@@ -168,18 +231,22 @@ Acknowledges the request and exits the server process.
 
 ```json
 {"id":1,"command":"load_rom","path":"/tmp/gbbrain-test.gb"}
-{"id":2,"command":"add_breakpoint","kind":"pc","address":272}
+{"id":2,"command":"add_breakpoint","kind":"opcode","address":64}
 {"id":3,"command":"run","max_instructions":64}
 {"id":4,"command":"get_trace","limit":8}
-{"id":5,"command":"get_serial_output","encoding":"text"}
-{"id":6,"command":"render_frame","encoding":"summary"}
-{"id":7,"command":"shutdown"}
+{"id":5,"command":"read_address","address":49152}
+{"id":6,"command":"write_address","address":49152,"value":66}
+{"id":7,"command":"save_snapshot"}
+{"id":8,"command":"disassemble","address":256,"count":4}
+{"id":9,"command":"get_serial_output","encoding":"text"}
+{"id":10,"command":"render_frame","encoding":"summary"}
+{"id":11,"command":"shutdown"}
 ```
 
 ## Current Limits
 
 - Only the GB/DMG machine scaffold is exposed
-- Opcode coverage is still minimal
+- Hardware accuracy work is still in progress
 - `render_frame` returns a deterministic debug frame, not a real LCD output yet
 - The protocol is intentionally simple and not yet JSON-RPC
 - The trace buffer is bounded to recent instructions only

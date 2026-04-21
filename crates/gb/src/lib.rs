@@ -326,6 +326,8 @@ fn cb_name(opcode: u8) -> String {
 /// Minimal DMG machine with a stable control and inspection surface.
 pub struct GbMachine {
     rom: Vec<u8>,
+    rom_bank: u16,
+    model: GbModel,
     eram: [u8; 0x2000],
     vram: [u8; 0x2000],
     wram: [u8; 0x2000],
@@ -334,10 +336,12 @@ pub struct GbMachine {
     hram: [u8; 0x7F],
     ie: u8,
     registers: Registers,
+    prefetched_pc: Option<u16>,
+    prefetched_opcode: Option<u8>,
     breakpoints: Vec<Breakpoint>,
     ime: bool,
     ime_enable_delay: u8,
-    halted: bool,
+    exec_state: ExecState,
     halt_bug: bool,
     instruction_counter: u64,
     cycle_counter: u64,
@@ -345,11 +349,9 @@ pub struct GbMachine {
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
     dma_source: u16,
-    dma_delay_cycles: u16,
-    dma_pending_source: Option<u16>,
-    dma_pending_delay_cycles: u16,
-    dma_cycles_remaining: u16,
-    dma_byte_cycles: u8,
+    dma_active: bool,
+    dma_requested_source: Option<u16>,
+    dma_starting_source: Option<u16>,
     dma_next_byte: u16,
     pending_watchpoint: Option<WatchpointHit>,
     trace: VecDeque<TraceEntry>,
@@ -372,6 +374,8 @@ pub struct DebugState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotState {
     rom: Vec<u8>,
+    rom_bank: u16,
+    model: GbModel,
     eram: Vec<u8>,
     vram: Vec<u8>,
     wram: Vec<u8>,
@@ -380,9 +384,12 @@ struct SnapshotState {
     hram: Vec<u8>,
     ie: u8,
     registers: Registers,
+    prefetched_pc: Option<u16>,
+    prefetched_opcode: Option<u8>,
     breakpoints: Vec<SnapshotBreakpoint>,
     ime: bool,
     ime_enable_delay: u8,
+    exec_state: ExecState,
     halted: bool,
     halt_bug: bool,
     instruction_counter: u64,
@@ -391,11 +398,9 @@ struct SnapshotState {
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
     dma_source: u16,
-    dma_delay_cycles: u16,
-    dma_pending_source: Option<u16>,
-    dma_pending_delay_cycles: u16,
-    dma_cycles_remaining: u16,
-    dma_byte_cycles: u8,
+    dma_active: bool,
+    dma_requested_source: Option<u16>,
+    dma_starting_source: Option<u16>,
     dma_next_byte: u16,
     pending_watchpoint: Option<WatchpointHit>,
     trace: Vec<SnapshotTraceEntry>,
@@ -435,14 +440,27 @@ struct SnapshotTraceEntry {
     stop_reason: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ExecState {
+    Running,
+    Halt,
+    InterruptDispatch,
+}
+
 impl GbMachine {
     pub fn new(rom: Vec<u8>) -> Result<Self, GbError> {
+        Self::new_with_model(rom, GbModel::Dmg)
+    }
+
+    pub fn new_with_model(rom: Vec<u8>, model: GbModel) -> Result<Self, GbError> {
         if rom.is_empty() {
             return Err(GbError::EmptyRom);
         }
 
         let mut machine = Self {
             rom,
+            rom_bank: 1,
+            model,
             eram: [0; 0x2000],
             vram: [0; 0x2000],
             wram: [0; 0x2000],
@@ -455,10 +473,12 @@ impl GbMachine {
                 pc: 0x0100,
                 ..Registers::default()
             },
+            prefetched_pc: None,
+            prefetched_opcode: None,
             breakpoints: Vec::new(),
             ime: false,
             ime_enable_delay: 0,
-            halted: false,
+            exec_state: ExecState::Running,
             halt_bug: false,
             instruction_counter: 0,
             cycle_counter: 0,
@@ -466,11 +486,9 @@ impl GbMachine {
             tima_reload_state: None,
             ppu_cycle_counter: 0,
             dma_source: 0,
-            dma_delay_cycles: 0,
-            dma_pending_source: None,
-            dma_pending_delay_cycles: 0,
-            dma_cycles_remaining: 0,
-            dma_byte_cycles: 0,
+            dma_active: false,
+            dma_requested_source: None,
+            dma_starting_source: None,
             dma_next_byte: 0,
             pending_watchpoint: None,
             trace: VecDeque::with_capacity(TRACE_CAPACITY),
@@ -481,6 +499,7 @@ impl GbMachine {
     }
 
     fn reset_state(&mut self) {
+        self.rom_bank = 1;
         self.eram.fill(0);
         self.vram.fill(0);
         self.wram.fill(0);
@@ -488,42 +507,31 @@ impl GbMachine {
         self.io.fill(0xFF);
         self.hram.fill(0);
         self.ie = 0;
-        self.registers = Registers {
-            a: 0x01,
-            f: 0xB0,
-            b: 0x00,
-            c: 0x13,
-            d: 0x00,
-            e: 0xD8,
-            h: 0x01,
-            l: 0x4D,
-            sp: 0xFFFE,
-            pc: 0x0100,
-        };
+        self.registers = self.model_boot_registers();
+        self.prefetched_pc = None;
+        self.prefetched_opcode = None;
         self.breakpoints.clear();
         self.ime = false;
         self.ime_enable_delay = 0;
-        self.halted = false;
+        self.exec_state = ExecState::Running;
         self.halt_bug = false;
         self.instruction_counter = 0;
         self.cycle_counter = 0;
-        self.div_counter = 0xABD0;
+        self.div_counter = self.model_boot_div_counter();
         self.tima_reload_state = None;
         self.ppu_cycle_counter = 0;
         self.dma_source = 0;
-        self.dma_delay_cycles = 0;
-        self.dma_pending_source = None;
-        self.dma_pending_delay_cycles = 0;
-        self.dma_cycles_remaining = 0;
-        self.dma_byte_cycles = 0;
+        self.dma_active = false;
+        self.dma_requested_source = None;
+        self.dma_starting_source = None;
         self.dma_next_byte = 0;
         self.pending_watchpoint = None;
         self.trace.clear();
         self.serial_output.clear();
-        self.io[0x00] = 0xCF; // P1
+        self.io[0x00] = self.model_boot_p1();
         self.io[(SERIAL_SB - IO_START) as usize] = 0x00;
         self.io[(SERIAL_SC - IO_START) as usize] = 0x7E;
-        self.io[(TIMER_DIV - IO_START) as usize] = 0xAB;
+        self.io[(TIMER_DIV - IO_START) as usize] = (self.div_counter >> 8) as u8;
         self.io[(TIMER_TIMA - IO_START) as usize] = 0x00;
         self.io[(TIMER_TMA - IO_START) as usize] = 0x00;
         self.io[(TIMER_TAC - IO_START) as usize] = 0xF8;
@@ -548,16 +556,16 @@ impl GbMachine {
         self.io[0x23] = 0xBF; // NR44
         self.io[0x24] = 0x77; // NR50
         self.io[0x25] = 0xF3; // NR51
-        self.io[0x26] = 0xF1; // NR52
-        self.io[(LCDC_REGISTER - IO_START) as usize] = 0x91;
-        self.io[(STAT_REGISTER - IO_START) as usize] = 0x80;
+        self.io[0x26] = self.model_boot_nr52(); // NR52
+        self.io[(LCDC_REGISTER - IO_START) as usize] = self.model_boot_lcdc();
+        self.io[(STAT_REGISTER - IO_START) as usize] = self.model_boot_stat();
         self.io[0x42] = 0x00; // SCY
         self.io[0x43] = 0x00; // SCX
-        self.io[(LY_REGISTER - IO_START) as usize] = 0x00;
-        self.io[0x45] = 0x00; // LYC
+        self.io[(LY_REGISTER - IO_START) as usize] = self.model_boot_ly();
+        self.io[0x45] = self.model_boot_lyc();
         self.io[(DMA_REGISTER - IO_START) as usize] = 0xFF;
         self.io[0x47] = 0xFC; // BGP
-        self.io[0x48] = 0xFF; // OBP0
+        self.io[0x48] = self.model_boot_obp0();
         self.io[0x49] = 0xFF; // OBP1
         self.io[0x4A] = 0x00; // WY
         self.io[0x4B] = 0x00; // WX
@@ -604,9 +612,153 @@ impl GbMachine {
         }
     }
 
+    pub fn model(&self) -> GbModel {
+        self.model
+    }
+
+    pub fn read_system_address(&mut self, address: u16) -> u8 {
+        self.read8(address)
+    }
+
+    pub fn write_system_address(&mut self, address: u16, value: u8) {
+        self.write8(address, value);
+    }
+
+    fn model_boot_registers(&self) -> Registers {
+        match self.model {
+            GbModel::Dmg0 => Registers {
+                a: 0x01,
+                f: 0x00,
+                b: 0xFF,
+                c: 0x13,
+                d: 0x00,
+                e: 0xC1,
+                h: 0x84,
+                l: 0x03,
+                sp: 0xFFFE,
+                pc: 0x0100,
+            },
+            GbModel::Dmg => Registers {
+                a: 0x01,
+                f: 0xB0,
+                b: 0x00,
+                c: 0x13,
+                d: 0x00,
+                e: 0xD8,
+                h: 0x01,
+                l: 0x4D,
+                sp: 0xFFFE,
+                pc: 0x0100,
+            },
+            GbModel::Mgb => Registers {
+                a: 0xFF,
+                f: 0xB0,
+                b: 0x00,
+                c: 0x13,
+                d: 0x00,
+                e: 0xD8,
+                h: 0x01,
+                l: 0x4D,
+                sp: 0xFFFE,
+                pc: 0x0100,
+            },
+            GbModel::Sgb => Registers {
+                a: 0x01,
+                f: 0x00,
+                b: 0x00,
+                c: 0x14,
+                d: 0x00,
+                e: 0x00,
+                h: 0xC0,
+                l: 0x60,
+                sp: 0xFFFE,
+                pc: 0x0100,
+            },
+            GbModel::Sgb2 => Registers {
+                a: 0xFF,
+                f: 0x00,
+                b: 0x00,
+                c: 0x14,
+                d: 0x00,
+                e: 0x00,
+                h: 0xC0,
+                l: 0x60,
+                sp: 0xFFFE,
+                pc: 0x0100,
+            },
+        }
+    }
+
+    fn model_boot_div_counter(&self) -> u16 {
+        match self.model {
+            GbModel::Dmg0 => 0x18D0,
+            GbModel::Dmg => 0xABD0,
+            GbModel::Mgb => 0xABD0,
+            GbModel::Sgb | GbModel::Sgb2 => 0xD8D0,
+        }
+    }
+
+    fn model_boot_p1(&self) -> u8 {
+        match self.model {
+            GbModel::Sgb | GbModel::Sgb2 => 0xFF,
+            _ => 0xCF,
+        }
+    }
+
+    fn model_boot_lcdc(&self) -> u8 {
+        match self.model {
+            GbModel::Dmg0 => 0x91,
+            GbModel::Dmg | GbModel::Mgb => 0x91,
+            GbModel::Sgb | GbModel::Sgb2 => 0x91,
+        }
+    }
+
+    fn model_boot_stat(&self) -> u8 {
+        match self.model {
+            GbModel::Dmg0 => 0x83,
+            GbModel::Dmg | GbModel::Mgb => 0x80,
+            GbModel::Sgb | GbModel::Sgb2 => 0x80,
+        }
+    }
+
+    fn model_boot_ly(&self) -> u8 {
+        match self.model {
+            GbModel::Dmg0 => 0x01,
+            _ => 0x00,
+        }
+    }
+
+    fn model_boot_lyc(&self) -> u8 {
+        match self.model {
+            GbModel::Dmg0 => 0x00,
+            GbModel::Dmg | GbModel::Mgb => 0x0A,
+            GbModel::Sgb | GbModel::Sgb2 => 0x00,
+        }
+    }
+
+    fn model_boot_obp0(&self) -> u8 {
+        match self.model {
+            GbModel::Sgb | GbModel::Sgb2 => 0x00,
+            _ => 0xFF,
+        }
+    }
+
+    fn model_boot_nr52(&self) -> u8 {
+        match self.model {
+            GbModel::Sgb | GbModel::Sgb2 => 0xF0,
+            _ => 0xF1,
+        }
+    }
+
+    fn set_exec_state(&mut self, state: ExecState) {
+        self.exec_state = state;
+    }
+
     pub fn save_state(&self) -> Result<Vec<u8>, GbError> {
         let state = SnapshotState {
             rom: self.rom.clone(),
+            rom_bank: self.rom_bank,
+            model: self.model,
             eram: self.eram.to_vec(),
             vram: self.vram.to_vec(),
             wram: self.wram.to_vec(),
@@ -615,6 +767,8 @@ impl GbMachine {
             hram: self.hram.to_vec(),
             ie: self.ie,
             registers: self.registers,
+            prefetched_pc: self.prefetched_pc,
+            prefetched_opcode: self.prefetched_opcode,
             breakpoints: self
                 .breakpoints
                 .iter()
@@ -623,7 +777,8 @@ impl GbMachine {
                 .collect(),
             ime: self.ime,
             ime_enable_delay: self.ime_enable_delay,
-            halted: self.halted,
+            exec_state: self.exec_state,
+            halted: matches!(self.exec_state, ExecState::Halt),
             halt_bug: self.halt_bug,
             instruction_counter: self.instruction_counter,
             cycle_counter: self.cycle_counter,
@@ -631,11 +786,9 @@ impl GbMachine {
             tima_reload_state: self.tima_reload_state,
             ppu_cycle_counter: self.ppu_cycle_counter,
             dma_source: self.dma_source,
-            dma_delay_cycles: self.dma_delay_cycles,
-            dma_pending_source: self.dma_pending_source,
-            dma_pending_delay_cycles: self.dma_pending_delay_cycles,
-            dma_cycles_remaining: self.dma_cycles_remaining,
-            dma_byte_cycles: self.dma_byte_cycles,
+            dma_active: self.dma_active,
+            dma_requested_source: self.dma_requested_source,
+            dma_starting_source: self.dma_starting_source,
             dma_next_byte: self.dma_next_byte,
             pending_watchpoint: self.pending_watchpoint,
             trace: self.trace.iter().copied().map(SnapshotTraceEntry::from).collect(),
@@ -652,7 +805,8 @@ impl GbMachine {
             return Err(GbError::EmptyRom);
         }
 
-        let mut machine = Self::new(state.rom)?;
+        let mut machine = Self::new_with_model(state.rom, state.model)?;
+        machine.rom_bank = state.rom_bank;
         machine.eram.copy_from_slice(&state.eram[..0x2000]);
         machine.vram.copy_from_slice(&state.vram[..0x2000]);
         machine.wram.copy_from_slice(&state.wram[..0x2000]);
@@ -661,10 +815,12 @@ impl GbMachine {
         machine.hram.copy_from_slice(&state.hram[..0x7F]);
         machine.ie = state.ie;
         machine.registers = state.registers;
+        machine.prefetched_pc = state.prefetched_pc;
+        machine.prefetched_opcode = state.prefetched_opcode;
         machine.breakpoints = state.breakpoints.into_iter().map(Breakpoint::from).collect();
         machine.ime = state.ime;
         machine.ime_enable_delay = state.ime_enable_delay;
-        machine.halted = state.halted;
+        machine.exec_state = if state.halted { ExecState::Halt } else { state.exec_state };
         machine.halt_bug = state.halt_bug;
         machine.instruction_counter = state.instruction_counter;
         machine.cycle_counter = state.cycle_counter;
@@ -672,11 +828,9 @@ impl GbMachine {
         machine.tima_reload_state = state.tima_reload_state;
         machine.ppu_cycle_counter = state.ppu_cycle_counter;
         machine.dma_source = state.dma_source;
-        machine.dma_delay_cycles = state.dma_delay_cycles;
-        machine.dma_pending_source = state.dma_pending_source;
-        machine.dma_pending_delay_cycles = state.dma_pending_delay_cycles;
-        machine.dma_cycles_remaining = state.dma_cycles_remaining;
-        machine.dma_byte_cycles = state.dma_byte_cycles;
+        machine.dma_active = state.dma_active;
+        machine.dma_requested_source = state.dma_requested_source;
+        machine.dma_starting_source = state.dma_starting_source;
         machine.dma_next_byte = state.dma_next_byte;
         machine.pending_watchpoint = state.pending_watchpoint;
         machine.trace = state.trace.into_iter().map(TraceEntry::from).collect();
@@ -936,10 +1090,9 @@ impl GbMachine {
         }
     }
 
-    fn read8_with_kind(&mut self, address: u16, kind: OamCorruptionKind) -> u8 {
+    fn read8_with_kind(&mut self, address: u16, _kind: OamCorruptionKind) -> u8 {
         self.record_watchpoint(WatchpointKind::Read, address);
         if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
-            self.maybe_trigger_oam_bug(address, kind);
             return 0xFF;
         }
         if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
@@ -960,8 +1113,12 @@ impl GbMachine {
             return 0xFF;
         }
         match address {
-            0x0000..=ROM_BANK_0_END | 0x4000..=ROM_BANK_N_END => {
+            0x0000..=ROM_BANK_0_END => {
                 self.rom.get(address as usize).copied().unwrap_or(0xFF)
+            }
+            0x4000..=ROM_BANK_N_END => {
+                let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(address - 0x4000);
+                self.rom.get(offset as usize).copied().unwrap_or(0xFF)
             }
             0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize],
             VRAM_START..=VRAM_END => self.vram[(address - VRAM_START) as usize],
@@ -973,6 +1130,17 @@ impl GbMachine {
             IE_REGISTER => self.ie,
             _ => 0xFF,
         }
+    }
+
+    fn read8_without_oam_bug(&mut self, address: u16) -> u8 {
+        self.record_watchpoint(WatchpointKind::Read, address);
+        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
+            return 0xFF;
+        }
+        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
+            return 0xFF;
+        }
+        self.peek8(address)
     }
 
     fn write8(&mut self, address: u16, value: u8) {
@@ -988,6 +1156,12 @@ impl GbMachine {
             return;
         }
         match address {
+            0x2000..=0x2FFF => {
+                self.rom_bank = (self.rom_bank & 0x100) | u16::from(value);
+            }
+            0x3000..=0x3FFF => {
+                self.rom_bank = (self.rom_bank & 0x0FF) | (u16::from(value & 0x01) << 8);
+            }
             0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize] = value,
             VRAM_START..=VRAM_END => self.vram[(address - VRAM_START) as usize] = value,
             WRAM_START..=WRAM_END => self.wram[(address - WRAM_START) as usize] = value,
@@ -1005,21 +1179,40 @@ impl GbMachine {
     }
 
     fn dma_active(&self) -> bool {
-        self.dma_delay_cycles == 0 && self.dma_cycles_remaining > 0
+        self.dma_active
     }
 
-    fn begin_dma(&mut self, source: u16, delay_cycles: u16) {
-        self.dma_source = source;
-        self.dma_delay_cycles = delay_cycles;
-        self.dma_cycles_remaining = 640;
-        self.dma_byte_cycles = 0;
-        self.dma_next_byte = 0;
+    fn step_dma_mcycle(&mut self) {
+        if self.dma_active {
+            if self.dma_next_byte < 0xA0 {
+                self.oam[self.dma_next_byte as usize] =
+                    self.dma_source_byte(self.dma_source.wrapping_add(self.dma_next_byte));
+                self.dma_next_byte += 1;
+            }
+            if self.dma_next_byte >= 0xA0 {
+                self.dma_active = false;
+            }
+        }
+
+        if let Some(source) = self.dma_starting_source.take() {
+            self.dma_source = source;
+            self.dma_active = true;
+            self.dma_next_byte = 0;
+        }
+
+        if let Some(source) = self.dma_requested_source.take() {
+            self.dma_starting_source = Some(source);
+        }
     }
 
     fn dma_source_byte(&self, address: u16) -> u8 {
         match address {
-            0x0000..=ROM_BANK_0_END | 0x4000..=ROM_BANK_N_END => {
+            0x0000..=ROM_BANK_0_END => {
                 self.rom.get(address as usize).copied().unwrap_or(0xFF)
+            }
+            0x4000..=ROM_BANK_N_END => {
+                let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(address - 0x4000);
+                self.rom.get(offset as usize).copied().unwrap_or(0xFF)
             }
             0x8000..=0x9FFF => self.vram[(address - 0x8000) as usize],
             0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize],
@@ -1081,14 +1274,7 @@ impl GbMachine {
             DMA_REGISTER => {
                 self.io[(address - IO_START) as usize] = value;
                 let source = u16::from(value) << 8;
-                if self.dma_active() {
-                    self.dma_pending_source = Some(source);
-                    self.dma_pending_delay_cycles = 8;
-                } else {
-                    self.dma_pending_source = None;
-                    self.dma_pending_delay_cycles = 0;
-                    self.begin_dma(source, 8);
-                }
+                self.dma_requested_source = Some(source);
             }
             TIMER_TAC => {
                 let old_signal = self.timer_signal();
@@ -1130,14 +1316,50 @@ impl GbMachine {
         value
     }
 
-    fn fetch16(&mut self) -> u16 {
-        let lo = u16::from(self.fetch8());
-        let hi = u16::from(self.fetch8());
-        lo | (hi << 8)
+    fn logical_pc(&self) -> u16 {
+        self.prefetched_pc.unwrap_or(self.registers.pc)
     }
 
-    fn fetch8_timed_late(&mut self) -> u8 {
+    fn logical_opcode(&self) -> u8 {
+        self.prefetched_opcode
+            .unwrap_or_else(|| self.peek8(self.registers.pc))
+    }
+
+    fn snapshot_registers(&self) -> CpuRegisters {
+        let mut registers = self.registers;
+        registers.pc = self.logical_pc();
+        registers.as_snapshot()
+    }
+
+    fn prefetch_next_cycle(&mut self, address: u16) {
+        self.tick_mcycle();
+        self.prefetched_pc = Some(address);
+        self.prefetched_opcode = Some(self.read8(address));
+        if self.ime && self.ime_enable_delay == 0 && self.pending_interrupts() != 0 {
+            self.registers.pc = address;
+            self.set_exec_state(ExecState::InterruptDispatch);
+        } else {
+            self.registers.pc = address.wrapping_add(1);
+            self.set_exec_state(ExecState::Running);
+        }
+    }
+
+    fn consume_opcode(&mut self) -> (u16, u8) {
+        if let (Some(pc), Some(opcode)) = (self.prefetched_pc.take(), self.prefetched_opcode.take()) {
+            (pc, opcode)
+        } else {
+            let opcode_pc = self.registers.pc;
+            let opcode = self.fetch8();
+            (opcode_pc, opcode)
+        }
+    }
+
+    fn tick_mcycle(&mut self) {
         self.tick_timers(4);
+    }
+
+    fn fetch8_cycle(&mut self) -> u8 {
+        self.tick_mcycle();
         let value = self.read8(self.registers.pc);
         if self.halt_bug {
             self.halt_bug = false;
@@ -1147,10 +1369,24 @@ impl GbMachine {
         value
     }
 
+    fn fetch8_timed_late(&mut self) -> u8 {
+        self.fetch8_cycle()
+    }
+
     fn fetch16_timed_late(&mut self) -> u16 {
         let lo = u16::from(self.fetch8_timed_late());
         let hi = u16::from(self.fetch8_timed_late());
         lo | (hi << 8)
+    }
+
+    fn read_cycle(&mut self, address: u16) -> u8 {
+        self.tick_mcycle();
+        self.read8(address)
+    }
+
+    fn write_cycle(&mut self, address: u16, value: u8) {
+        self.tick_mcycle();
+        self.write8(address, value);
     }
 
     fn read_r8(&mut self, index: u8) -> u8 {
@@ -1167,24 +1403,20 @@ impl GbMachine {
         }
     }
 
-    fn read_hl_timed_late(&mut self) -> u8 {
-        self.tick_timers(4);
-        self.read8(self.registers.hl())
+    fn read_r8_operand(&mut self, index: u8) -> u8 {
+        if index == 6 {
+            self.read_cycle(self.registers.hl())
+        } else {
+            self.read_r8(index)
+        }
     }
 
-    fn read8_timed_late(&mut self, address: u16) -> u8 {
-        self.tick_timers(4);
-        self.read8(address)
+    fn read_hl_timed_late(&mut self) -> u8 {
+        self.read_cycle(self.registers.hl())
     }
 
     fn write_hl_timed_late(&mut self, value: u8) {
-        self.tick_timers(4);
-        self.write8(self.registers.hl(), value);
-    }
-
-    fn write8_timed_late(&mut self, address: u16, value: u8) {
-        self.tick_timers(4);
-        self.write8(address, value);
+        self.write_cycle(self.registers.hl(), value);
     }
 
     fn write_r8(&mut self, index: u8, value: u8) {
@@ -1371,13 +1603,30 @@ impl GbMachine {
         self.set_flag(0x10, carry);
     }
 
-    fn jump_relative(&mut self) {
-        let offset = self.fetch8() as i8;
+    fn ctrl_jp(&mut self, address: u16) {
+        self.registers.pc = address;
+        self.tick_mcycle();
+    }
+
+    fn ctrl_jr(&mut self, offset: i8) {
         self.registers.pc = self.registers.pc.wrapping_add_signed(i16::from(offset));
+        self.tick_mcycle();
+    }
+
+    fn ctrl_call(&mut self, address: u16) -> Result<(), GbError> {
+        self.tick_mcycle();
+        self.push16(self.registers.pc)?;
+        self.registers.pc = address;
+        Ok(())
+    }
+
+    fn ctrl_ret(&mut self) {
+        self.registers.pc = self.pop16();
+        self.tick_mcycle();
     }
 
     fn execute_cb_prefixed(&mut self) -> Result<u16, GbError> {
-        let opcode = self.fetch8();
+        let opcode = self.fetch8_timed_late();
         match opcode {
             0x00..=0x07 => {
                 let target = opcode & 0x07;
@@ -1397,7 +1646,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x08..=0x0F => {
                 let target = opcode & 0x07;
@@ -1417,7 +1667,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x10..=0x17 => {
                 let target = opcode & 0x07;
@@ -1438,7 +1689,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x18..=0x1F => {
                 let target = opcode & 0x07;
@@ -1459,7 +1711,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x20..=0x27 => {
                 let target = opcode & 0x07;
@@ -1479,7 +1732,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x28..=0x2F => {
                 let target = opcode & 0x07;
@@ -1499,7 +1753,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x30..=0x37 => {
                 let target = opcode & 0x07;
@@ -1518,7 +1773,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, false);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x38..=0x3F => {
                 let target = opcode & 0x07;
@@ -1538,7 +1794,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x40..=0x7F => {
                 let bit = (opcode - 0x40) / 8;
@@ -1551,7 +1808,8 @@ impl GbMachine {
                 self.set_flag(0x80, value & (1 << bit) == 0);
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, true);
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0x80..=0xBF => {
                 let bit = (opcode - 0x80) / 8;
@@ -1566,7 +1824,8 @@ impl GbMachine {
                 } else {
                     self.write_r8(target, value);
                 }
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
             0xC0..=0xFF => {
                 let bit = (opcode - 0xC0) / 8;
@@ -1581,7 +1840,8 @@ impl GbMachine {
                 } else {
                     self.write_r8(target, value);
                 }
-                Ok(if target == 6 { 8 } else { 8 })
+                self.prefetch_next_cycle(self.registers.pc);
+                Ok(0)
             }
         }
     }
@@ -1590,22 +1850,22 @@ impl GbMachine {
         let hi = (value >> 8) as u8;
         let lo = value as u8;
         self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
-        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.write8(self.registers.sp, hi);
+        self.write_cycle(self.registers.sp, hi);
         self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
-        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.write8(self.registers.sp, lo);
+        self.write_cycle(self.registers.sp, lo);
         Ok(())
     }
 
     fn pop16(&mut self) -> u16 {
-        self.tick_timers(4);
-        let lo = u16::from(self.read8(self.registers.sp));
+        self.tick_mcycle();
+        let lo = u16::from(self.read8_without_oam_bug(self.registers.sp));
+        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        self.tick_timers(4);
-        let hi = u16::from(self.read8(self.registers.sp));
+        self.tick_mcycle();
+        let hi = u16::from(self.read8_without_oam_bug(self.registers.sp));
+        self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.registers.sp = self.registers.sp.wrapping_add(1);
         lo | (hi << 8)
     }
@@ -1707,74 +1967,50 @@ impl GbMachine {
             .find(|(mask, _)| pending & mask != 0)
     }
 
-    fn service_interrupt(&mut self) -> Result<bool, GbError> {
+    fn execute_interrupt_dispatch(&mut self) -> Result<bool, GbError> {
         let pending = self.pending_interrupts();
-        if pending == 0 {
+        let Some(_) = Self::highest_priority_interrupt(pending) else {
+            self.set_exec_state(ExecState::Running);
             return Ok(false);
-        }
+        };
 
-        if !self.ime {
-            return Ok(false);
-        }
-
-        if Self::highest_priority_interrupt(pending).is_none() {
-            return Ok(false);
-        }
-
+        self.prefetched_pc = None;
+        self.prefetched_opcode = None;
         self.ime = false;
         let pc = self.registers.pc;
         let hi = (pc >> 8) as u8;
         let lo = pc as u8;
 
-        self.tick_timers(8);
-
-        self.tick_timers(4);
+        self.tick_mcycle();
+        self.tick_mcycle();
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.write8(self.registers.sp, hi);
+        self.write_cycle(self.registers.sp, hi);
 
         let pending_after_hi = self.pending_interrupts();
         let Some((selected_mask, vector)) = Self::highest_priority_interrupt(pending_after_hi) else {
             self.registers.pc = 0x0000;
+            self.set_exec_state(ExecState::Running);
             return Ok(true);
         };
 
-        self.tick_timers(4);
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.write8(self.registers.sp, lo);
+        self.write_cycle(self.registers.sp, lo);
 
         let index = (IF_REGISTER - IO_START) as usize;
         self.io[index] = (self.io[index] & !selected_mask) | 0xE0;
         self.registers.pc = vector;
-        self.tick_timers(4);
+        self.prefetch_next_cycle(self.registers.pc);
+        self.set_exec_state(ExecState::Running);
         Ok(true)
     }
 
     fn tick_timers(&mut self, cycles: u16) {
-        self.cycle_counter += u64::from(cycles);
         for _ in 0..cycles {
-            if let Some(source) = self.dma_pending_source {
-                self.dma_pending_delay_cycles -= 1;
-                if self.dma_pending_delay_cycles == 0 {
-                    self.dma_pending_source = None;
-                    self.begin_dma(source, 0);
-                }
-            }
-
+            self.cycle_counter += 1;
             self.step_timer_cycle();
             self.step_ppu_cycle();
-            if self.dma_delay_cycles > 0 {
-                self.dma_delay_cycles -= 1;
-            } else if self.dma_cycles_remaining > 0 {
-                self.dma_cycles_remaining -= 1;
-                self.dma_byte_cycles = self.dma_byte_cycles.wrapping_add(1);
-                if self.dma_byte_cycles == 4 {
-                    self.dma_byte_cycles = 0;
-                    if self.dma_next_byte < 0xA0 {
-                        self.oam[self.dma_next_byte as usize] =
-                            self.dma_source_byte(self.dma_source.wrapping_add(self.dma_next_byte));
-                        self.dma_next_byte += 1;
-                    }
-                }
+            if self.cycle_counter % 4 == 0 {
+                self.step_dma_mcycle();
             }
         }
     }
@@ -1783,82 +2019,97 @@ impl GbMachine {
         let suppress_interrupt_dispatch = self.ime_enable_delay != 0;
         self.ime_enable_delay = 0;
 
-        if self.halted {
-            self.tick_timers(4);
-            let pending = self.pending_interrupts();
-            if pending == 0 {
-                return Ok(RunResult {
-                    stop_reason: StopReason::Halted,
-                });
-            }
-
-            self.halted = false;
-            if !suppress_interrupt_dispatch && self.ime && self.service_interrupt()? {
-                return Ok(RunResult {
-                    stop_reason: StopReason::BreakpointHit,
-                });
-            }
-
-            return Ok(RunResult {
-                stop_reason: StopReason::StepComplete,
-            });
-        }
-
-        if !suppress_interrupt_dispatch && self.service_interrupt()? {
-            return Ok(RunResult {
-                stop_reason: StopReason::BreakpointHit,
-            });
-        }
-
         self.pending_watchpoint = None;
 
-        let pc = self.registers.pc;
+        loop {
+            match self.exec_state {
+                ExecState::InterruptDispatch => {
+                    if self.execute_interrupt_dispatch()? {
+                        return Ok(RunResult {
+                            stop_reason: StopReason::StepComplete,
+                        });
+                    }
+                }
+                ExecState::Halt => {
+                    if self.pending_interrupts() == 0 {
+                        self.tick_mcycle();
+                        return Ok(RunResult {
+                            stop_reason: StopReason::Halted,
+                        });
+                    }
+
+                    self.set_exec_state(ExecState::Running);
+                    self.prefetch_next_cycle(self.registers.pc);
+                    if !suppress_interrupt_dispatch && matches!(self.exec_state, ExecState::InterruptDispatch) {
+                        continue;
+                    }
+
+                    return Ok(RunResult {
+                        stop_reason: StopReason::StepComplete,
+                    });
+                }
+                ExecState::Running => {}
+            }
+            break;
+        }
+
+        let pc = self.logical_pc();
         if self.has_pc_breakpoint(pc) {
             return Ok(RunResult {
                 stop_reason: StopReason::BreakpointHit,
             });
         }
-        if self.has_opcode_breakpoint(self.peek8(pc)) {
+        if self.has_opcode_breakpoint(self.logical_opcode()) {
             return Ok(RunResult {
                 stop_reason: StopReason::BreakpointHit,
             });
         }
 
-        let opcode_pc = self.registers.pc;
-        let opcode = self.fetch8();
+        let (opcode_pc, opcode) = self.consume_opcode();
 
         let cycles = match opcode {
-            0x00 => 4,
+            0x00 => {
+                self.prefetch_next_cycle(self.registers.pc);
+                0
+            }
             0x01 => {
-                let value = self.fetch16();
+                let value = self.fetch16_timed_late();
                 self.registers.set_bc(value);
-                12
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x02 => {
-                self.write8(self.registers.bc(), self.registers.a);
-                8
+                self.write_cycle(self.registers.bc(), self.registers.a);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x03 => {
                 self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
                 let value = self.registers.bc().wrapping_add(1);
                 self.registers.set_bc(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x04 => {
                 self.registers.b = self.inc8(self.registers.b);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3E => {
-                self.registers.a = self.fetch8();
-                8
+                self.registers.a = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x05 => {
                 self.registers.b = self.dec8(self.registers.b);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x06 => {
-                self.registers.b = self.fetch8();
-                8
+                self.registers.b = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x07 => {
                 let carry = self.registers.a & 0x80 != 0;
@@ -1867,7 +2118,8 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0F => {
                 let carry = self.registers.a & 0x01 != 0;
@@ -1876,52 +2128,66 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x09 => {
                 self.add16_hl(self.registers.bc());
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0A => {
-                self.registers.a = self.read8(self.registers.bc());
-                8
+                self.registers.a = self.read_cycle(self.registers.bc());
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0B => {
                 self.maybe_trigger_oam_bug(self.registers.bc(), OamCorruptionKind::Write);
                 let value = self.registers.bc().wrapping_sub(1);
                 self.registers.set_bc(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0C => {
                 self.registers.c = self.inc8(self.registers.c);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0D => {
                 self.registers.c = self.dec8(self.registers.c);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x0E => {
-                self.registers.c = self.fetch8();
-                8
+                self.registers.c = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x11 => {
-                let value = self.fetch16();
+                let value = self.fetch16_timed_late();
                 self.registers.set_de(value);
-                12
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x12 => {
-                self.write8(self.registers.de(), self.registers.a);
-                8
+                self.write_cycle(self.registers.de(), self.registers.a);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x13 => {
                 self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
                 let value = self.registers.de().wrapping_add(1);
                 self.registers.set_de(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x14 => {
                 self.registers.d = self.inc8(self.registers.d);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x17 => {
                 let carry_in = u8::from(self.flag_c());
@@ -1931,41 +2197,52 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x15 => {
                 self.registers.d = self.dec8(self.registers.d);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x16 => {
-                self.registers.d = self.fetch8();
-                8
+                self.registers.d = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1A => {
-                self.registers.a = self.read8(self.registers.de());
-                8
+                self.registers.a = self.read_cycle(self.registers.de());
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1B => {
                 self.maybe_trigger_oam_bug(self.registers.de(), OamCorruptionKind::Write);
                 let value = self.registers.de().wrapping_sub(1);
                 self.registers.set_de(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1C => {
                 self.registers.e = self.inc8(self.registers.e);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1D => {
                 self.registers.e = self.dec8(self.registers.e);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1E => {
-                self.registers.e = self.fetch8();
-                8
+                self.registers.e = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x18 => {
-                self.jump_relative();
-                12
+                let offset = self.fetch8_timed_late() as i8;
+                self.ctrl_jr(offset);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x1F => {
                 let carry_in = if self.flag_c() { 0x80 } else { 0 };
@@ -1975,185 +2252,222 @@ impl GbMachine {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry_out);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x19 => {
                 self.add16_hl(self.registers.de());
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x20 => {
                 if !self.flag_z() {
-                    self.jump_relative();
-                    12
+                    let offset = self.fetch8_timed_late() as i8;
+                    self.ctrl_jr(offset);
                 } else {
-                    self.fetch8();
-                    8
+                    self.fetch8_timed_late();
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x21 => {
-                let value = self.fetch16();
+                let value = self.fetch16_timed_late();
                 self.registers.set_hl(value);
-                12
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x29 => {
                 let hl = self.registers.hl();
                 self.add16_hl(hl);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x23 => {
                 self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
                 let value = self.registers.hl().wrapping_add(1);
                 self.registers.set_hl(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x22 => {
                 let address = self.registers.hl();
-                self.write8(address, self.registers.a);
+                self.write_cycle(address, self.registers.a);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_add(1));
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x24 => {
                 self.registers.h = self.inc8(self.registers.h);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x25 => {
                 self.registers.h = self.dec8(self.registers.h);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x26 => {
-                self.registers.h = self.fetch8();
-                8
+                self.registers.h = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2A => {
                 let address = self.registers.hl();
-                self.registers.a = self.read8_with_kind(address, OamCorruptionKind::ReadWrite);
+                self.registers.a = self.read_cycle(address);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_add(1));
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2B => {
                 self.maybe_trigger_oam_bug(self.registers.hl(), OamCorruptionKind::Write);
                 let value = self.registers.hl().wrapping_sub(1);
                 self.registers.set_hl(value);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2F => {
                 self.registers.a = !self.registers.a;
                 self.set_flag(0x40, true);
                 self.set_flag(0x20, true);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2C => {
                 self.registers.l = self.inc8(self.registers.l);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2D => {
                 self.registers.l = self.dec8(self.registers.l);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x2E => {
-                self.registers.l = self.fetch8();
-                8
+                self.registers.l = self.fetch8_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x31 => {
-                self.registers.sp = self.fetch16();
-                12
+                self.registers.sp = self.fetch16_timed_late();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x33 => {
                 self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
                 self.registers.sp = self.registers.sp.wrapping_add(1);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x39 => {
                 self.add16_hl(self.registers.sp);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3B => {
                 self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
                 self.registers.sp = self.registers.sp.wrapping_sub(1);
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x34 => {
-                let value = self.read8(self.registers.hl());
+                let address = self.registers.hl();
+                let value = self.read_cycle(address);
                 let result = self.inc8(value);
-                self.tick_timers(4);
-                self.write8(self.registers.hl(), result);
-                8
+                self.write_cycle(address, result);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x35 => {
-                let value = self.read8(self.registers.hl());
+                let address = self.registers.hl();
+                let value = self.read_cycle(address);
                 let result = self.dec8(value);
-                self.tick_timers(4);
-                self.write8(self.registers.hl(), result);
-                8
+                self.write_cycle(address, result);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x30 => {
                 if !self.flag_c() {
-                    self.jump_relative();
-                    12
+                    let offset = self.fetch8_timed_late() as i8;
+                    self.ctrl_jr(offset);
                 } else {
-                    self.fetch8();
-                    8
+                    self.fetch8_timed_late();
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x28 => {
                 if self.flag_z() {
-                    self.jump_relative();
-                    12
+                    let offset = self.fetch8_timed_late() as i8;
+                    self.ctrl_jr(offset);
                 } else {
-                    self.fetch8();
-                    8
+                    self.fetch8_timed_late();
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x27 => {
                 self.daa();
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x38 => {
                 if self.flag_c() {
-                    self.jump_relative();
-                    12
+                    let offset = self.fetch8_timed_late() as i8;
+                    self.ctrl_jr(offset);
                 } else {
-                    self.fetch8();
-                    8
+                    self.fetch8_timed_late();
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3A => {
                 let address = self.registers.hl();
-                self.tick_timers(4);
-                self.registers.a = self.read8_with_kind(address, OamCorruptionKind::ReadWrite);
+                self.registers.a = self.read_cycle(address);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3C => {
                 self.registers.a = self.inc8(self.registers.a);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3D => {
                 self.registers.a = self.dec8(self.registers.a);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x3F => {
                 let carry = !self.flag_c();
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, carry);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x32 => {
                 let address = self.registers.hl();
-                self.tick_timers(4);
-                self.write8(address, self.registers.a);
+                self.write_cycle(address, self.registers.a);
                 self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
                 self.registers.set_hl(address.wrapping_sub(1));
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x36 => {
-                let value = self.fetch8();
-                self.write_hl_timed_late(value);
-                8
+                let value = self.fetch8_timed_late();
+                self.write_cycle(self.registers.hl(), value);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x40..=0x7F if opcode != 0x76 => {
                 let dst = (opcode >> 3) & 0x07;
@@ -2162,428 +2476,452 @@ impl GbMachine {
                     (6, 6) => unreachable!("HALT is excluded from this opcode range"),
                     (6, _) => {
                         let value = self.read_r8(src);
-                        self.write_hl_timed_late(value);
-                        4
+                        self.write_cycle(self.registers.hl(), value);
+                        self.prefetch_next_cycle(self.registers.pc);
+                        0
                     }
                     (_, 6) => {
-                        let value = self.read_hl_timed_late();
+                        let value = self.read_cycle(self.registers.hl());
                         self.write_r8(dst, value);
-                        4
+                        self.prefetch_next_cycle(self.registers.pc);
+                        0
                     }
                     _ => {
                         let value = self.read_r8(src);
                         self.write_r8(dst, value);
-                        4
+                        self.prefetch_next_cycle(self.registers.pc);
+                        0
                     }
                 }
             }
             0x80..=0x87 => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.add8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x88..=0x8F => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.adc8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x90..=0x97 => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.sub8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x98..=0x9F => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.sbc8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xAF => {
                 self.registers.a = 0;
                 self.registers.f = 0x80;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC1 => {
                 let value = self.pop16();
                 self.registers.set_bc(value);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC0 => {
                 if self.condition_true(0) {
-                    self.tick_timers(8);
                     self.registers.pc = self.pop16();
-                    self.tick_timers(4);
+                    self.tick_mcycle();
+                    self.prefetch_next_cycle(self.registers.pc);
                     0
                 } else {
-                    8
+                    self.tick_mcycle();
+                    self.prefetch_next_cycle(self.registers.pc);
+                    0
                 }
             }
             0xCB => self.execute_cb_prefixed()?,
             0xC9 => {
-                self.tick_timers(4);
-                self.registers.pc = self.pop16();
-                self.tick_timers(4);
+                self.ctrl_ret();
+                self.prefetch_next_cycle(self.registers.pc);
                 0
             }
             0xC3 => {
                 let address = self.fetch16_timed_late();
-                self.tick_timers(4);
-                self.registers.pc = address;
-                4
+                self.ctrl_jp(address);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC2 => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(0) {
-                    self.registers.pc = address;
-                    self.tick_timers(4);
-                    4
-                } else {
-                    4
+                    self.ctrl_jp(address);
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC5 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.bc())?;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC6 => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.add8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC4 => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(0) {
-                    self.tick_timers(4);
-                    self.push16(self.registers.pc)?;
-                    self.registers.pc = address;
-                    4
-                } else {
-                    4
+                    self.ctrl_call(address)?;
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC8 => {
                 if self.condition_true(1) {
-                    self.tick_timers(8);
-                    self.registers.pc = self.pop16();
-                    self.tick_timers(4);
+                    self.ctrl_ret();
+                    self.prefetch_next_cycle(self.registers.pc);
                     0
                 } else {
-                    8
+                    self.tick_mcycle();
+                    self.prefetch_next_cycle(self.registers.pc);
+                    0
                 }
             }
             0xCA => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(1) {
-                    self.registers.pc = address;
-                    self.tick_timers(4);
-                    4
-                } else {
-                    4
+                    self.ctrl_jp(address);
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xCC => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(1) {
-                    self.tick_timers(4);
-                    self.push16(self.registers.pc)?;
-                    self.registers.pc = address;
-                    4
-                } else {
-                    4
+                    self.ctrl_call(address)?;
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xCD => {
                 let address = self.fetch16_timed_late();
-                self.tick_timers(4);
-                self.push16(self.registers.pc)?;
-                self.registers.pc = address;
-                4
+                self.ctrl_call(address)?;
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xCE => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.adc8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xC7 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0000;
-                4
+                self.prefetch_next_cycle(0x0000);
+                0
             }
             0xCF => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0008;
-                4
+                self.prefetch_next_cycle(0x0008);
+                0
             }
             0xD7 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0010;
-                4
+                self.prefetch_next_cycle(0x0010);
+                0
             }
             0xDF => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0018;
-                4
+                self.prefetch_next_cycle(0x0018);
+                0
             }
             0xD1 => {
                 let value = self.pop16();
                 self.registers.set_de(value);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD0 => {
                 if self.condition_true(2) {
-                    self.tick_timers(8);
-                    self.registers.pc = self.pop16();
-                    self.tick_timers(4);
+                    self.ctrl_ret();
+                    self.prefetch_next_cycle(self.registers.pc);
                     0
                 } else {
-                    8
+                    self.tick_mcycle();
+                    self.prefetch_next_cycle(self.registers.pc);
+                    0
                 }
             }
             0xD5 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.de())?;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD2 => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(2) {
-                    self.registers.pc = address;
-                    self.tick_timers(4);
-                    4
-                } else {
-                    4
+                    self.ctrl_jp(address);
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD4 => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(2) {
-                    self.tick_timers(4);
-                    self.push16(self.registers.pc)?;
-                    self.registers.pc = address;
-                    4
-                } else {
-                    4
+                    self.ctrl_call(address)?;
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD6 => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.sub8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xDE => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.sbc8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD8 => {
                 if self.condition_true(3) {
-                    self.tick_timers(8);
-                    self.registers.pc = self.pop16();
-                    self.tick_timers(4);
+                    self.ctrl_ret();
+                    self.prefetch_next_cycle(self.registers.pc);
                     0
                 } else {
-                    8
+                    self.tick_mcycle();
+                    self.prefetch_next_cycle(self.registers.pc);
+                    0
                 }
             }
             0xDA => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(3) {
-                    self.registers.pc = address;
-                    self.tick_timers(4);
-                    4
-                } else {
-                    4
+                    self.ctrl_jp(address);
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xDC => {
                 let address = self.fetch16_timed_late();
                 if self.condition_true(3) {
-                    self.tick_timers(4);
-                    self.push16(self.registers.pc)?;
-                    self.registers.pc = address;
-                    4
-                } else {
-                    4
+                    self.ctrl_call(address)?;
                 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xEA => {
                 let address = self.fetch16_timed_late();
-                self.write8_timed_late(address, self.registers.a);
-                4
+                self.write_cycle(address, self.registers.a);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE0 => {
                 let offset = self.fetch8_timed_late();
-                self.write8_timed_late(0xFF00 | u16::from(offset), self.registers.a);
-                4
+                self.write_cycle(0xFF00 | u16::from(offset), self.registers.a);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE2 => {
-                self.write8(0xFF00 | u16::from(self.registers.c), self.registers.a);
-                8
+                self.write_cycle(0xFF00 | u16::from(self.registers.c), self.registers.a);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE1 => {
                 let value = self.pop16();
                 self.registers.set_hl(value);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE5 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.hl())?;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE6 => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.and8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE7 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0020;
-                4
+                self.prefetch_next_cycle(0x0020);
+                0
             }
             0xE8 => {
                 let offset = self.fetch8_timed_late() as i8;
-                self.tick_timers(8);
                 self.registers.sp = self.add_sp_signed(offset);
-                4
+                self.tick_mcycle();
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xE9 => {
-                self.registers.pc = self.registers.hl();
-                4
+                self.prefetch_next_cycle(self.registers.hl());
+                0
             }
             0xEF => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0028;
-                4
+                self.prefetch_next_cycle(0x0028);
+                0
             }
             0xF6 => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.or8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xEE => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.xor8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xFA => {
                 let address = self.fetch16_timed_late();
-                self.registers.a = self.read8_timed_late(address);
-                4
+                self.registers.a = self.read_cycle(address);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF0 => {
                 let offset = self.fetch8_timed_late();
-                self.registers.a = self.read8_timed_late(0xFF00 | u16::from(offset));
-                4
+                self.registers.a = self.read_cycle(0xFF00 | u16::from(offset));
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF1 => {
                 let value = self.pop16();
                 self.registers.set_af(value);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF8 => {
                 let offset = self.fetch8_timed_late() as i8;
-                self.tick_timers(4);
                 let value = self.add_sp_signed(offset);
                 self.registers.set_hl(value);
-                4
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF9 => {
                 self.registers.sp = self.registers.hl();
-                8
+                self.tick_mcycle();
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF3 => {
                 self.ime = false;
                 self.ime_enable_delay = 0;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF2 => {
-                self.registers.a = self.read8(0xFF00 | u16::from(self.registers.c));
-                8
+                self.registers.a = self.read_cycle(0xFF00 | u16::from(self.registers.c));
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF5 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.af())?;
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xF7 => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0030;
-                4
+                self.prefetch_next_cycle(0x0030);
+                0
             }
             0xFE => {
-                let value = self.fetch8();
+                let value = self.fetch8_timed_late();
                 self.cp8(value);
-                8
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xFF => {
-                self.tick_timers(4);
+                self.tick_mcycle();
                 self.push16(self.registers.pc)?;
-                self.registers.pc = 0x0038;
-                4
+                self.prefetch_next_cycle(0x0038);
+                0
             }
             0xFB => {
                 if !self.ime {
                     self.ime = true;
                     self.ime_enable_delay = 1;
                 }
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xD9 => {
-                self.tick_timers(4);
-                self.registers.pc = self.pop16();
-                self.tick_timers(4);
+                self.ctrl_ret();
                 self.ime = true;
                 self.ime_enable_delay = 0;
+                self.prefetch_next_cycle(self.registers.pc);
                 0
             }
             0x08 => {
-                let address = self.fetch16();
-                self.tick_timers(12);
-                self.write8(address, self.registers.sp as u8);
-                self.tick_timers(4);
-                self.write8(address.wrapping_add(1), (self.registers.sp >> 8) as u8);
-                4
+                let address = self.fetch16_timed_late();
+                self.write_cycle(address, self.registers.sp as u8);
+                self.write_cycle(address.wrapping_add(1), (self.registers.sp >> 8) as u8);
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xA0..=0xA7 => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.and8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xA8..=0xAE => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.xor8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xB8..=0xBF => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.cp8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0xB0..=0xB7 => {
-                let value = self.read_r8(opcode & 0x07);
+                let value = self.read_r8_operand(opcode & 0x07);
                 self.or8(value);
-                if opcode & 0x07 == 6 { 8 } else { 4 }
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x37 => {
                 self.set_flag(0x40, false);
                 self.set_flag(0x20, false);
                 self.set_flag(0x10, true);
-                4
+                self.prefetch_next_cycle(self.registers.pc);
+                0
             }
             0x76 => {
                 if !self.ime && self.pending_interrupts() != 0 {
                     self.halt_bug = true;
                 } else {
-                    self.halted = true;
+                    self.set_exec_state(ExecState::Halt);
+                    self.tick_mcycle();
                 }
-                4
+                0
             }
             _ => {
                 return Err(GbError::UnsupportedOpcode {
@@ -2596,11 +2934,11 @@ impl GbMachine {
         self.instruction_counter += 1;
         self.tick_timers(cycles);
 
-        let stop_reason = if self.halted {
+        let stop_reason = if matches!(self.exec_state, ExecState::Halt) {
             StopReason::Halted
         } else if self.pending_watchpoint.is_some() {
             StopReason::WatchpointHit
-        } else if self.has_pc_breakpoint(self.registers.pc) {
+        } else if self.has_pc_breakpoint(self.logical_pc()) {
             StopReason::BreakpointHit
         } else {
             StopReason::StepComplete
@@ -2622,8 +2960,12 @@ impl GbMachine {
         let mut bytes = Vec::with_capacity(len);
         for current in address..=end {
             let value = match current {
-                0x0000..=ROM_BANK_0_END | 0x4000..=ROM_BANK_N_END => {
+                0x0000..=ROM_BANK_0_END => {
                     self.rom.get(current as usize).copied().unwrap_or(0xFF)
+                }
+                0x4000..=ROM_BANK_N_END => {
+                    let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(current - 0x4000);
+                    self.rom.get(offset as usize).copied().unwrap_or(0xFF)
                 }
                 0xA000..=0xBFFF => self.eram[(current - 0xA000) as usize],
                 VRAM_START..=VRAM_END => self.vram[(current - VRAM_START) as usize],
@@ -2650,8 +2992,8 @@ impl Machine for GbMachine {
 
     fn snapshot(&self) -> MachineSnapshot {
         MachineSnapshot {
-            registers: self.registers.as_snapshot(),
-            halted: self.halted,
+            registers: self.snapshot_registers(),
+            halted: matches!(self.exec_state, ExecState::Halt),
             instruction_counter: self.instruction_counter,
         }
     }
@@ -2746,7 +3088,7 @@ mod tests {
     use gbbrain_core::{Breakpoint, Machine, MachineControl, MemoryRegion, StopReason};
 
     use super::{
-        GbMachine, IF_REGISTER, LCDC_REGISTER, LY_REGISTER, TIMER_DIV, TIMER_TAC, TIMER_TIMA,
+        ExecState, GbMachine, IF_REGISTER, LCDC_REGISTER, LY_REGISTER, TIMER_DIV, TIMER_TAC, TIMER_TIMA,
         TIMER_TMA,
     };
 
@@ -2816,6 +3158,21 @@ mod tests {
     }
 
     #[test]
+    fn direct_system_address_read_write_works() {
+        let rom = vec![0; 0x200];
+        let mut machine = GbMachine::new(rom).unwrap();
+
+        machine.write_system_address(0xC000, 0x42);
+
+        assert_eq!(machine.read_system_address(0xC000), 0x42);
+        assert_eq!(
+            machine.inspect_memory(MemoryRegion::AddressSpace(gbbrain_core::AddressSpace::System), 0xC000, 1)
+                .unwrap(),
+            vec![0x42]
+        );
+    }
+
+    #[test]
     fn ei_enables_interrupts_after_following_instruction() {
         let mut rom = vec![0; 0x200];
         rom[0x100] = 0xFB;
@@ -2849,7 +3206,7 @@ mod tests {
         machine.request_interrupt(0x01);
 
         assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert!(!machine.halted);
+        assert!(!matches!(machine.exec_state, ExecState::Halt));
         assert_eq!(machine.snapshot().registers.pc, 0x0101);
 
         assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
@@ -2944,5 +3301,36 @@ mod tests {
         }
 
         assert_eq!(triggered_after, Some(7));
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GbModel {
+    Dmg0,
+    Dmg,
+    Mgb,
+    Sgb,
+    Sgb2,
+}
+
+impl GbModel {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "dmg0" => Some(Self::Dmg0),
+            "dmg" => Some(Self::Dmg),
+            "mgb" => Some(Self::Mgb),
+            "sgb" => Some(Self::Sgb),
+            "sgb2" => Some(Self::Sgb2),
+            _ => None,
+        }
+    }
+
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Dmg0 => "dmg0",
+            Self::Dmg => "dmg",
+            Self::Mgb => "mgb",
+            Self::Sgb => "sgb",
+            Self::Sgb2 => "sgb2",
+        }
     }
 }

@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gbbrain_core::{
     Breakpoint, FrameBuffer, Machine, MachineControl, MemoryRegion, RenderTarget, StopReason,
 };
-use gbbrain_gb::{DebugState, DisassembledInstruction, GbMachine, TraceEntry};
+use gbbrain_gb::{DebugState, DisassembledInstruction, GbMachine, GbModel, TraceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -290,7 +290,8 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
         }
     };
 
-    if let Err(error) = client.load_rom(path) {
+    let model = infer_model_from_rom_path(path);
+    if let Err(error) = client.load_rom(path, model) {
         return SuiteResult {
             status: SuiteStatus::Error,
             detail: Some(error),
@@ -446,6 +447,23 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     }
 }
 
+fn infer_model_from_rom_path(path: &Path) -> &'static str {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if name.contains("-dmg0") {
+        "dmg0"
+    } else if name.contains("-mgb") {
+        "mgb"
+    } else if name.contains("-sgb2") {
+        "sgb2"
+    } else if name.contains("-sgb") {
+        "sgb"
+    } else if name.contains("-S") {
+        "sgb"
+    } else {
+        "dmg"
+    }
+}
+
 fn detect_blargg_ram_result(client: &mut StdioSession) -> Result<Option<(SuiteStatus, String)>, String> {
     let bytes = client.inspect_memory("system", 0xA000, 64)?;
     if bytes.len() < 4 || bytes[1..4] != [0xDE, 0xB0, 0x61] {
@@ -527,10 +545,11 @@ impl StdioSession {
         })
     }
 
-    fn load_rom(&mut self, path: &Path) -> Result<(), String> {
+    fn load_rom(&mut self, path: &Path, model: &str) -> Result<(), String> {
         self.request(json!({
             "command": "load_rom",
-            "path": path
+            "path": path,
+            "model": model
         }))
         .map(|_| ())
     }
@@ -714,6 +733,8 @@ impl SessionState {
                     "run",
                     "snapshot",
                     "inspect_memory",
+                    "read_address",
+                    "write_address",
                     "disassemble",
                     "save_snapshot",
                     "load_snapshot",
@@ -726,9 +747,10 @@ impl SessionState {
                     "render_frame",
                     "shutdown"
                 ],
-                "breakpoint_kinds": ["pc", "opcode", "memory_read", "memory_write"]
+                "breakpoint_kinds": ["pc", "opcode", "memory_read", "memory_write"],
+                "models": ["dmg0", "dmg", "mgb", "sgb", "sgb2"]
             })),
-            Request::LoadRom { path } => self.load_rom(path),
+            Request::LoadRom { path, model } => self.load_rom(path, model),
             Request::Reset => {
                 let machine = self.machine_mut()?;
                 machine.reset().map_err(|error| error.to_string())?;
@@ -754,6 +776,8 @@ impl SessionState {
                 address,
                 len,
             } => self.inspect_memory(region, address, len),
+            Request::ReadAddress { address } => self.read_address(address),
+            Request::WriteAddress { address, value } => self.write_address(address, value),
             Request::AddBreakpoint { kind, address } => self.add_breakpoint(&kind, address),
             Request::ClearBreakpoints => {
                 let machine = self.machine_mut()?;
@@ -779,15 +803,22 @@ impl SessionState {
         }
     }
 
-    fn load_rom(&mut self, path: String) -> Result<Value, String> {
+    fn load_rom(&mut self, path: String, model: Option<String>) -> Result<Value, String> {
         let rom = fs::read(&path).map_err(|error| format!("failed to read ROM '{path}': {error}"))?;
-        let machine = GbMachine::new(rom).map_err(|error| error.to_string())?;
+        let model = match model {
+            Some(name) => GbModel::from_name(&name)
+                .ok_or_else(|| format!("unsupported model: {name}"))?,
+            None => GbModel::Dmg,
+        };
+        let machine = GbMachine::new_with_model(rom, model).map_err(|error| error.to_string())?;
         self.machine = Some(machine);
         self.rom_path = Some(PathBuf::from(&path));
-        let snapshot = Self::snapshot_dto(self.machine.as_ref().expect("machine just loaded"));
+        let machine = self.machine.as_ref().expect("machine just loaded");
+        let snapshot = Self::snapshot_dto(machine);
 
         Ok(json!({
             "platform": "gb",
+            "model": machine.model().as_name(),
             "rom_path": path,
             "snapshot": snapshot
         }))
@@ -891,6 +922,33 @@ impl SessionState {
             "address": address,
             "len": bytes.len(),
             "bytes": bytes
+        }))
+    }
+
+    fn read_address(&mut self, address: u32) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let address =
+            u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
+        let value = machine.read_system_address(address);
+
+        Ok(json!({
+            "address": address,
+            "value": value
+        }))
+    }
+
+    fn write_address(&mut self, address: u32, value: u32) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let address =
+            u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
+        let value = u8::try_from(value).map_err(|_| format!("value out of range: {value}"))?;
+        machine.write_system_address(address, value);
+        let read_back = machine.read_system_address(address);
+
+        Ok(json!({
+            "address": address,
+            "value": value,
+            "read_back": read_back
         }))
     }
 
@@ -1026,7 +1084,7 @@ struct RequestEnvelope {
 enum Request {
     Ping,
     Help,
-    LoadRom { path: String },
+    LoadRom { path: String, model: Option<String> },
     Reset,
     Step { count: Option<u64> },
     RunForCycles { cycles: u64 },
@@ -1034,6 +1092,8 @@ enum Request {
     Run { max_instructions: Option<u64> },
     Snapshot,
     InspectMemory { region: String, address: u32, len: usize },
+    ReadAddress { address: u32 },
+    WriteAddress { address: u32, value: u32 },
     Disassemble { address: u32, count: Option<usize> },
     SaveSnapshot,
     LoadSnapshot { bytes_base64: String },
@@ -1288,8 +1348,9 @@ fn execute_for_instructions(machine: &mut GbMachine, count: u64) -> Result<StopR
         let result = machine
             .step_instruction()
             .map_err(|error| error.to_string())?;
-        if result.stop_reason != StopReason::StepComplete {
-            return Ok(result.stop_reason);
+        match result.stop_reason {
+            StopReason::StepComplete | StopReason::Halted => {}
+            other => return Ok(other),
         }
     }
     Ok(StopReason::RunLimitReached)

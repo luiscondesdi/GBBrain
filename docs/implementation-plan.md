@@ -14,11 +14,14 @@ Build a deterministic, headless emulator for GB, GBC, and GBA that AI agents can
 ## Core Principles
 
 1. Deterministic execution
-2. Scriptable control surface
-3. Introspectable machine state
-4. Reproducible save/load snapshots
-5. Hardware accuracy prioritized over wall-clock speed in debug mode
-6. Frame rendering available as data, not as a GUI surface
+2. Hardware accuracy is non-negotiable
+3. Scriptable control surface
+4. Introspectable machine state
+5. Reproducible save/load snapshots
+6. Hardware accuracy prioritized over wall-clock speed in debug mode
+7. Frame rendering available as data, not as a GUI surface
+
+Accuracy comes before interface stability. If the debug protocol, snapshot format, or CLI surface needs to change to match actual hardware behavior, the hardware model wins and the tooling must adapt around it.
 
 ## Architecture
 
@@ -35,9 +38,33 @@ Build a deterministic, headless emulator for GB, GBC, and GBA that AI agents can
 
 - Library-first architecture with a thin CLI wrapper
 - Separate machine implementations per platform with shared debugging traits
+- Cycle-accurate execution model for the hardware core:
+  - each bus read/write is an explicit machine cycle
+  - internal delay cycles are explicit, not implied by opcode totals
+  - opcode prefetch is a real hardware step, not hidden bookkeeping
+  - timer, DMA, LCD/PPU, and interrupt edge logic advance once per machine cycle
 - Two execution modes:
   - `accurate`: prioritize correctness and determinism
   - `fast`: relaxed instrumentation for throughput
+
+### Accuracy Refactor Direction
+
+The DMG core should converge toward the `mooneye-gb` architecture rather than continue accumulating opcode-local timing tweaks.
+
+That means:
+
+- CPU execution should be written as ordered cycle actions such as `read_cycle`, `write_cycle`, `tick_cycle`, and `prefetch_next`.
+- Timing-sensitive behavior must emerge from the cycle model instead of being patched instruction-by-instruction to satisfy ROM tests.
+- OAM DMA, timer edges, interrupt dispatch, and LCD/STAT transitions should be stepped from the same shared machine-cycle scheduler.
+- Debug tooling must observe this model faithfully, even if that requires changing current protocol responses or stop semantics.
+
+Short-term refactor order:
+
+1. Introduce explicit cycle primitives and a real prefetch step in the DMG core.
+2. Migrate stack/control and remaining timing-sensitive load/store families onto that model.
+3. Move DMA start/end edges, interrupt dispatch, and timer reload behavior fully onto the shared machine-cycle path.
+4. Rework PPU/LCD/STAT timing around explicit mode transitions rather than coarse LY counters.
+5. Only after the machine model is correct, adapt the debug API where necessary to expose the new behavior cleanly.
 
 ### Agent-Facing Surface
 
@@ -157,6 +184,13 @@ Deliverable:
 ## Current Sequencing Note
 
 - The active inner loop is still DMG correctness and timing.
+- The current highest-value architecture work is replacing opcode-total timing patches with an explicit cycle model.
+- The immediate verified failure frontier is now concentrated in:
+  - startup-state / boot-phase accuracy
+  - interrupt and HALT edge behavior
+  - memory timing
+  - OAM bug behavior
+  - the larger PPU/LCD/STAT timing block
 - Some validation paths that require CGB behavior may be skipped temporarily while the machine is DMG-only.
 - Those deferred cases must come back as soon as CGB-specific hardware work starts.
 - GBA work should reuse the same agent-facing control model instead of introducing a separate debugging surface.
