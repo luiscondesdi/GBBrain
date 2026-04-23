@@ -9,11 +9,40 @@ impl Machine for GbMachine {
         self
     }
 
+    fn model(&self) -> gbbrain_core::Platform {
+        match self.model {
+            GbModel::Dmg0 | GbModel::Dmg | GbModel::Mgb | GbModel::Sgb | GbModel::Sgb2 => {
+                gbbrain_core::Platform::Gb
+            }
+        }
+    }
+
+    fn model_name(&self) -> &'static str {
+        self.model.as_name()
+    }
+
     fn snapshot(&self) -> MachineSnapshot {
         MachineSnapshot {
             registers: self.snapshot_registers(),
             halted: matches!(self.exec_state, ExecState::Halt | ExecState::Stop),
             instruction_counter: self.instruction_counter,
+        }
+    }
+
+    fn debug_state(&self) -> gbbrain_core::DebugState {
+        let state = GbMachine::debug_state(self);
+        gbbrain_core::DebugState {
+            cycle_counter: state.cycle_counter,
+            div_counter: state.div_counter,
+            ppu_cycle_counter: state.ppu_cycle_counter,
+            frame_counter: state.frame_counter,
+            ppu_mode: state.ppu_mode,
+            ime: state.ime,
+            ie: state.ie,
+            if_reg: state.if_reg,
+            lcdc: state.lcdc,
+            stat: state.stat,
+            ly: state.ly,
         }
     }
 
@@ -47,6 +76,107 @@ impl Machine for GbMachine {
                 self.system_memory_slice(u16::try_from(address).ok()?, len)
             }
         }
+    }
+
+    fn read_address(&mut self, address: u16) -> u8 {
+        self.read_system_address(address)
+    }
+
+    fn write_address(&mut self, address: u16, value: u8) {
+        self.write_system_address(address, value);
+    }
+
+    fn trace_entries(&self) -> Vec<gbbrain_core::TraceEntry> {
+        GbMachine::trace_entries(self)
+            .into_iter()
+            .map(|entry| gbbrain_core::TraceEntry {
+                instruction_counter: entry.instruction_counter,
+                pc: entry.pc,
+                opcode: entry.opcode,
+                a: entry.a,
+                f: entry.f,
+                b: entry.b,
+                c: entry.c,
+                d: entry.d,
+                e: entry.e,
+                h: entry.h,
+                l: entry.l,
+                sp: entry.sp,
+                stop_reason: entry.stop_reason,
+            })
+            .collect()
+    }
+
+    fn clear_trace(&mut self) {
+        GbMachine::clear_trace(self);
+    }
+
+    fn serial_output(&self) -> &[u8] {
+        GbMachine::serial_output(self)
+    }
+
+    fn clear_serial_output(&mut self) {
+        GbMachine::clear_serial_output(self);
+    }
+
+    fn cartridge_info(&self) -> gbbrain_core::CartridgeInfo {
+        gbbrain_core::CartridgeInfo {
+            title: self.cartridge_title().to_string(),
+            type_code: self.cartridge_type_code(),
+            has_battery: self.cartridge_has_battery(),
+            has_rtc: self.cartridge_has_rtc(),
+        }
+    }
+
+    fn pressed_buttons_mask(&self) -> u8 {
+        self.joypad.pressed
+    }
+
+    fn set_pressed_buttons_mask(&mut self, pressed: u8) {
+        GbMachine::set_pressed_buttons_mask(self, pressed);
+    }
+
+    fn last_watchpoint(&self) -> Option<gbbrain_core::WatchpointHit> {
+        self.last_watchpoint().map(|(kind, address)| gbbrain_core::WatchpointHit {
+            kind: match kind {
+                "read" => gbbrain_core::WatchpointKind::Read,
+                "write" => gbbrain_core::WatchpointKind::Write,
+                _ => gbbrain_core::WatchpointKind::Read,
+            },
+            address,
+        })
+    }
+
+    fn disassemble_range(
+        &self,
+        start: u16,
+        count: usize,
+    ) -> Vec<gbbrain_core::DisassembledInstruction> {
+        GbMachine::disassemble_range(self, start, count)
+            .into_iter()
+            .map(|instruction| gbbrain_core::DisassembledInstruction {
+                address: instruction.address,
+                bytes: instruction.bytes,
+                text: instruction.text,
+                len: instruction.len,
+            })
+            .collect()
+    }
+
+    fn save_cartridge_state(&self) -> Result<Vec<u8>, Self::Error> {
+        GbMachine::save_cartridge_state(self)
+    }
+
+    fn load_cartridge_state(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        GbMachine::load_cartridge_state(self, bytes)
+    }
+
+    fn save_cartridge_ram(&self) -> Vec<u8> {
+        GbMachine::save_cartridge_ram(self)
+    }
+
+    fn load_cartridge_ram(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        GbMachine::load_cartridge_ram(self, bytes)
     }
 
     fn render_frame(&self, _target: RenderTarget) -> Result<FrameBuffer, Self::Error> {
@@ -209,6 +339,38 @@ impl MachineControl for GbMachine {
         for _ in 0..DEFAULT_RUN_LIMIT {
             let result = self.execute_next_instruction()?;
             if result.stop_reason != StopReason::StepComplete {
+                return Ok(result);
+            }
+        }
+
+        Ok(RunResult {
+            stop_reason: StopReason::RunLimitReached,
+        })
+    }
+
+    fn run_for_cycles(&mut self, cycles: u64) -> Result<RunResult, Self::Error> {
+        let start_cycles = self.cycle_counter;
+        while self.cycle_counter - start_cycles < cycles {
+            let result = self.execute_next_instruction()?;
+            if result.stop_reason != StopReason::StepComplete
+                && result.stop_reason != StopReason::Halted
+            {
+                return Ok(result);
+            }
+        }
+
+        Ok(RunResult {
+            stop_reason: StopReason::RunLimitReached,
+        })
+    }
+
+    fn run_for_frames(&mut self, count: u64) -> Result<RunResult, Self::Error> {
+        let start_frame_counter = self.frame_counter;
+        while self.frame_counter - start_frame_counter < count {
+            let result = self.execute_next_instruction()?;
+            if result.stop_reason != StopReason::StepComplete
+                && result.stop_reason != StopReason::Halted
+            {
                 return Ok(result);
             }
         }

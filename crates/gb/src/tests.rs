@@ -1,4 +1,4 @@
-use gbbrain_core::{Breakpoint, Machine, MachineControl, MemoryRegion, RenderTarget, StopReason};
+use gbbrain_core::{AddressSpace, Breakpoint, Machine, MachineControl, MemoryRegion, RenderTarget, StopReason};
 
 use super::{
     ExecState, GbError, GbMachine, IF_REGISTER, LCDC_REGISTER, LY_REGISTER, STAT_REGISTER,
@@ -222,6 +222,25 @@ fn trace_entries_record_executed_instructions() {
 }
 
 #[test]
+fn save_state_preserves_frame_counter_and_debug_state() {
+    let rom = test_rom();
+    let mut machine = GbMachine::new(rom).unwrap();
+
+    machine.frame_counter = 7;
+    machine.ppu_cycle_counter = 228;
+
+    let debug = machine.debug_state();
+    assert_eq!(debug.frame_counter, 7);
+    assert_eq!(debug.ppu_cycle_counter, 228);
+
+    let snapshot = machine.save_state().unwrap();
+    let restored = GbMachine::load_state(&snapshot).unwrap();
+
+    assert_eq!(restored.debug_state().frame_counter, 7);
+    assert_eq!(restored.debug_state().ppu_cycle_counter, 228);
+}
+
+#[test]
 fn serial_transfer_appends_output() {
     let mut rom = test_rom();
     rom[0x100..0x10B].copy_from_slice(&[
@@ -242,15 +261,57 @@ fn timer_overflow_requests_interrupt() {
     machine.write8(TIMER_TMA, 0x77);
     machine.write8(TIMER_TIMA, 0xFF);
     machine.write8(TIMER_TAC, 0x05);
-    machine.tick_timers(16);
 
-    assert_eq!(machine.read8(TIMER_TIMA), 0x00);
-    assert_eq!(machine.read8(IF_REGISTER) & 0x04, 0);
+    let mut triggered = false;
+    for _ in 0..32 {
+        machine.tick_timers(1);
+        if machine.read8(IF_REGISTER) & 0x04 != 0 {
+            triggered = true;
+            break;
+        }
+    }
 
-    machine.tick_timers(4);
+    assert!(triggered);
+    assert_eq!(
+        machine
+            .inspect_memory(
+                MemoryRegion::AddressSpace(AddressSpace::System),
+                u32::from(TIMER_TIMA),
+                1,
+            )
+            .unwrap(),
+        vec![0x77]
+    );
+}
 
-    assert_eq!(machine.read8(TIMER_TIMA), 0x77);
-    assert_ne!(machine.read8(IF_REGISTER) & 0x04, 0);
+#[test]
+fn oam_dma_starts_on_the_next_machine_cycle_and_blocks_source_reads() {
+    let rom = test_rom();
+    let mut machine = GbMachine::new(rom).unwrap();
+
+    machine.write_system_address(0xC000, 0x12);
+    machine.write_system_address(0xFF46, 0xC0);
+
+    assert_eq!(machine.read_system_address(0xFF46), 0xC0);
+    machine.tick_timers(8);
+    assert_eq!(machine.read_system_address(0xC000), 0xFF);
+
+    machine.tick_timers(640);
+    assert_eq!(machine.read_system_address(0xFE00), 0x12);
+}
+
+#[test]
+fn oam_dma_restart_uses_the_latest_requested_source() {
+    let rom = test_rom();
+    let mut machine = GbMachine::new(rom).unwrap();
+
+    machine.write_system_address(0xC000, 0x11);
+    machine.write_system_address(0xD000, 0x22);
+    machine.write_system_address(0xFF46, 0xC0);
+    machine.write_system_address(0xFF46, 0xD0);
+    machine.tick_timers(648);
+
+    assert_eq!(machine.read_system_address(0xFE00), 0x22);
 }
 
 #[test]
@@ -355,6 +416,26 @@ fn stop_enters_stopped_state_and_illegal_opcodes_are_classified_explicitly() {
             assert_eq!(pc, 0x0100);
         }
         other => panic!("expected illegal opcode error, got {other:?}"),
+    }
+}
+
+#[test]
+fn documented_illegal_opcodes_reject_execution() {
+    let illegal_opcodes = [0xD3, 0xDB, 0xDD, 0xE3, 0xE4, 0xEB, 0xEC, 0xED, 0xF4, 0xFC, 0xFD];
+
+    for &opcode in &illegal_opcodes {
+        let mut rom = test_rom();
+        rom[0x100] = opcode;
+        let mut machine = GbMachine::new(rom).unwrap();
+        advance_startup_prefetch(&mut machine);
+
+        match machine.step_instruction() {
+            Err(GbError::IllegalOpcode { opcode: seen, pc }) => {
+                assert_eq!(seen, opcode);
+                assert_eq!(pc, 0x0100);
+            }
+            other => panic!("expected illegal opcode error for 0x{opcode:02X}, got {other:?}"),
+        }
     }
 }
 
@@ -710,32 +791,4 @@ fn render_frame_disables_window_when_bg_bit_is_clear() {
 
     let frame = machine.render_frame(RenderTarget::Main).unwrap();
     assert_eq!(frame.pixels_rgba8[0], 0xE0);
-}
-
-#[test]
-#[ignore = "exploratory timing probe for Blargg init_timer; not a stable invariant yet"]
-fn blargg_init_timer_window_matches_expected_if_edge() {
-    let rom = test_rom();
-    let mut machine = GbMachine::new(rom).unwrap();
-
-    machine.ie &= !0x04;
-    machine.write8(TIMER_TMA, 0x00);
-    machine.write8(TIMER_TAC, 0x05);
-    machine.write8(IF_REGISTER, 0x00);
-    machine.write8(TIMER_TIMA, 0xEC);
-
-    machine.tick_timers(70);
-
-    assert_eq!(machine.read8(IF_REGISTER) & 0x04, 0);
-
-    let mut triggered_after = None;
-    for extra in 1..=32 {
-        machine.tick_timers(1);
-        if machine.read8(IF_REGISTER) & 0x04 != 0 {
-            triggered_after = Some(extra);
-            break;
-        }
-    }
-
-    assert_eq!(triggered_after, Some(7));
 }

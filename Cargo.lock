@@ -67,6 +67,9 @@ dependencies = [
 [[package]]
 name = "gbbrain-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "gbbrain-gb"

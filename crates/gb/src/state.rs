@@ -53,6 +53,7 @@ impl GbMachine {
             div_counter: 0,
             tima_reload_state: None,
             ppu_cycle_counter: 0,
+            frame_counter: 0,
             ppu_mode: PpuMode::AccessOam,
             ppu_mode_cycles_remaining: PPU_ACCESS_OAM_CYCLES,
             dma_source: 0,
@@ -177,6 +178,7 @@ impl GbMachine {
             cycle_counter: self.cycle_counter,
             div_counter: self.div_counter,
             ppu_cycle_counter: self.ppu_cycle_counter,
+            frame_counter: self.frame_counter,
             ppu_mode: self.ppu_mode.bits(),
             ime: self.ime,
             ie: self.ie,
@@ -579,6 +581,7 @@ impl GbMachine {
             div_counter: self.div_counter,
             tima_reload_state: self.tima_reload_state,
             ppu_cycle_counter: self.ppu_cycle_counter,
+            frame_counter: self.frame_counter,
             ppu_mode: self.ppu_mode,
             ppu_mode_cycles_remaining: self.ppu_mode_cycles_remaining,
             dma_source: self.dma_source,
@@ -641,6 +644,7 @@ impl GbMachine {
         machine.div_counter = state.div_counter;
         machine.tima_reload_state = state.tima_reload_state;
         machine.ppu_cycle_counter = state.ppu_cycle_counter;
+        machine.frame_counter = state.frame_counter;
         machine.ppu_mode = state.ppu_mode;
         machine.ppu_mode_cycles_remaining = state.ppu_mode_cycles_remaining;
         machine.dma_source = state.dma_source;

@@ -76,6 +76,16 @@ impl GbMachine {
         }
     }
 
+    pub(crate) fn read_io_value_cycle(&mut self, address: u16) -> u8 {
+        match address {
+            TIMER_DIV | TIMER_TIMA | TIMER_TMA | TIMER_TAC => {
+                self.step_timer_cycle();
+                self.read_io_value(address)
+            }
+            _ => self.read_io_value(address),
+        }
+    }
+
     pub(crate) fn cpu_bus(address: u16) -> Bus {
         match address {
             0x0000..=ROM_BANK_N_END
@@ -204,6 +214,9 @@ impl GbMachine {
         }
         if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
             return 0xFF;
+        }
+        if matches!(address, TIMER_DIV | TIMER_TIMA | TIMER_TMA | TIMER_TAC) {
+            return self.read_io_value_cycle(address);
         }
         if self.dma_blocks_cpu_access(address) {
             return 0xFF;
@@ -384,12 +397,21 @@ impl GbMachine {
                 self.refresh_stat();
             }
             LY_REGISTER => {
+                let old_match =
+                    self.io[(LY_REGISTER - IO_START) as usize] == self.io[(0xFF45 - IO_START) as usize];
                 self.io[(address - IO_START) as usize] = 0;
+                let new_match =
+                    self.io[(LY_REGISTER - IO_START) as usize] == self.io[(0xFF45 - IO_START) as usize];
+                self.set_stat_lyc_flag(new_match);
+                if new_match && !old_match && (self.io[(STAT_REGISTER - IO_START) as usize] & 0x40 != 0) {
+                    self.request_interrupt(0x02);
+                }
             }
             0xFF45 => {
                 self.io[(address - IO_START) as usize] = value;
             }
             TIMER_DIV => {
+                self.step_timer_cycle();
                 let old_signal = self.timer_signal();
                 self.div_counter = 0;
                 self.io[(address - IO_START) as usize] = 0;
@@ -398,6 +420,7 @@ impl GbMachine {
                 }
             }
             TIMER_TIMA => {
+                self.step_timer_cycle();
                 match self.tima_reload_state {
                     Some(TimaReloadState::OverflowDelay(_)) => {
                         self.tima_reload_state = None;
@@ -410,6 +433,7 @@ impl GbMachine {
                 self.io[(address - IO_START) as usize] = value;
             }
             TIMER_TMA => {
+                self.step_timer_cycle();
                 self.io[(address - IO_START) as usize] = value;
                 if matches!(
                     self.tima_reload_state,
@@ -432,6 +456,7 @@ impl GbMachine {
                 }
             }
             TIMER_TAC => {
+                self.step_timer_cycle();
                 let old_signal = self.timer_signal();
                 self.io[(address - IO_START) as usize] = value | 0xF8;
                 if old_signal && !self.timer_signal() {

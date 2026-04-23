@@ -7,9 +7,10 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use gbbrain_core::{
-    Breakpoint, FrameBuffer, Machine, MachineControl, MemoryRegion, RenderTarget, StopReason,
+    Breakpoint, DisassembledInstruction, FrameBuffer, Machine, MachineControl, MemoryRegion,
+    RenderTarget, StopReason,
 };
-use gbbrain_gb::{DebugState, DisassembledInstruction, GbMachine, GbModel, TraceEntry};
+use gbbrain_gb::{DebugState, GbMachine, GbModel, TraceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -19,15 +20,71 @@ fn main() -> ExitCode {
 
     match args.get(1).map(String::as_str) {
         Some("serve") => run_stdio_server(),
+        Some("mcp") => run_mcp_server(),
         Some("suite") => run_suite(&args[2..]),
         Some(path) => run_single_shot(path),
         None => {
             eprintln!(
-                "usage: gbbrain <rom-path> | gbbrain serve | gbbrain suite dmg [blargg|mooneye|all]"
+                "usage: gbbrain <rom-path> | gbbrain serve | gbbrain mcp | gbbrain suite dmg [blargg|mooneye|all]"
             );
             ExitCode::from(2)
         }
     }
+}
+
+fn run_mcp_server() -> ExitCode {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut output = io::BufWriter::new(stdout.lock());
+    let mut state = SessionState::default();
+
+    for line_result in stdin.lock().lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = write_mcp_response(
+                    &mut output,
+                    None,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32603, "message": format!("failed to read stdin: {error}") }
+                    }),
+                );
+                return ExitCode::from(1);
+            }
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let request: McpRequest = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = write_mcp_response(
+                    &mut output,
+                    None,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "error": { "code": -32700, "message": format!("invalid JSON request: {error}") }
+                    }),
+                );
+                continue;
+            }
+        };
+
+        let should_shutdown = matches!(request.method.as_str(), "shutdown");
+        let response = handle_mcp_request(&mut state, request);
+        if write_mcp_response(&mut output, response.0, response.1).is_err() {
+            return ExitCode::from(1);
+        }
+
+        if should_shutdown {
+            return ExitCode::SUCCESS;
+        }
+    }
+
+    ExitCode::SUCCESS
 }
 
 fn run_suite(args: &[String]) -> ExitCode {
@@ -197,6 +254,616 @@ fn run_stdio_server() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+#[derive(Debug, Deserialize)]
+struct McpRequest {
+    #[serde(default)]
+    id: Option<Value>,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+fn handle_mcp_request(state: &mut SessionState, request: McpRequest) -> (Option<Value>, Value) {
+    let id = request.id;
+    let response = match request.method.as_str() {
+        "initialize" => json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {
+                    "name": "gbbrain",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {
+                    "tools": {},
+                    "resources": {},
+                    "prompts": {}
+                }
+            }
+        }),
+        "tools/list" => json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tools": mcp_tools()
+            }
+        }),
+        "resources/list" => json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "resources": [
+                    {
+                        "uri": "gbbrain://snapshot",
+                        "name": "Current Snapshot",
+                        "description": "Current machine snapshot and debug state",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "gbbrain://cartridge",
+                        "name": "Cartridge Metadata",
+                        "description": "Metadata for the loaded cartridge",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "gbbrain://trace",
+                        "name": "Instruction Trace",
+                        "description": "Recent instruction trace entries",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uri": "gbbrain://serial",
+                        "name": "Serial Output",
+                        "description": "Captured serial output text",
+                        "mimeType": "text/plain"
+                    }
+                ]
+            }
+        }),
+        "resources/templates" => json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "resourceTemplates": [
+                    {
+                        "uriTemplate": "gbbrain://memory/{region}/{address}/{len}",
+                        "name": "Memory Range",
+                        "description": "Read a memory range from a named region",
+                        "mimeType": "application/json"
+                    },
+                    {
+                        "uriTemplate": "gbbrain://disasm/{address}/{count}",
+                        "name": "Disassembly Range",
+                        "description": "Disassemble code starting at an address",
+                        "mimeType": "application/json"
+                    }
+                ]
+            }
+        }),
+        "resources/read" => {
+            let uri = request
+                .params
+                .get("uri")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match read_mcp_resource(state, uri) {
+                Ok(result) => json!({ "jsonrpc": "2.0", "result": result }),
+                Err(error) => json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32602, "message": error }
+                }),
+            }
+        }
+        "prompts/list" => json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "prompts": [
+                    {
+                        "name": "title_screen_probe",
+                        "description": "Probe a commercial ROM title screen using the current debug surface"
+                    }
+                ]
+            }
+        }),
+        "prompts/get" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match name {
+                "title_screen_probe" => json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "description": "Use the emulator to reach the game's title screen and inspect the relevant frame.",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": "Load the ROM, prefer a real boot ROM for DMG/MGB/SGB validation, run until the first meaningful frame or title-entry breakpoint, inspect the current snapshot, trace, serial output, and rendered frame, and report the smallest concrete hardware issue blocking title-screen capture. Do not chase tests."
+                                }
+                            }
+                        ]
+                    }
+                }),
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32602, "message": format!("unsupported prompt: {name}") }
+                }),
+            }
+        }
+        "tools/call" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let arguments = request.params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match call_mcp_tool(state, name, arguments) {
+                Ok(result) => mcp_tool_response(result),
+                Err(error) => json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": error
+                        }],
+                        "isError": true
+                    }
+                }),
+            }
+        }
+        "shutdown" => json!({ "jsonrpc": "2.0", "result": { "shutdown": true } }),
+        _ => json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32601, "message": format!("unknown method: {}", request.method) }
+        }),
+    };
+    (id, response)
+}
+
+fn read_mcp_resource(state: &SessionState, uri: &str) -> Result<Value, String> {
+    match uri {
+        "gbbrain://snapshot" => {
+            let machine = state.machine_ref()?;
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&SessionState::snapshot_dto(machine))
+                        .unwrap_or_else(|_| "{}".to_string())
+                }]
+            }))
+        }
+        "gbbrain://cartridge" => {
+            let machine = state.machine_ref()?;
+            let info = machine.cartridge_info();
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "title": info.title,
+                        "type_code": info.type_code,
+                        "has_battery": info.has_battery,
+                        "has_rtc": info.has_rtc
+                    })).unwrap_or_else(|_| "{}".to_string())
+                }]
+            }))
+        }
+        "gbbrain://trace" => {
+            let machine = state.machine_ref()?;
+            let trace: Vec<Value> = machine
+                .trace_entries()
+                .into_iter()
+                .map(|entry| {
+                    json!({
+                        "instruction_counter": entry.instruction_counter,
+                        "pc": entry.pc,
+                        "opcode": entry.opcode,
+                        "a": entry.a,
+                        "f": entry.f,
+                        "b": entry.b,
+                        "c": entry.c,
+                        "d": entry.d,
+                        "e": entry.e,
+                        "h": entry.h,
+                        "l": entry.l,
+                        "sp": entry.sp,
+                        "stop_reason": stop_reason_name(entry.stop_reason)
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&trace)
+                        .unwrap_or_else(|_| "[]".to_string())
+                }]
+            }))
+        }
+        "gbbrain://serial" => {
+            let machine = state.machine_ref()?;
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": String::from_utf8_lossy(machine.serial_output()).to_string()
+                }]
+            }))
+        }
+        _ if uri.starts_with("gbbrain://memory/") => {
+            let (region, address, len) = parse_memory_uri(uri)?;
+            let parsed_region = parse_memory_region(&region)?;
+            let machine = state.machine_ref()?;
+            let bytes = machine
+                .inspect_memory(parsed_region, address, len)
+                .ok_or_else(|| format!("requested memory range is unavailable: {uri}"))?;
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "region": memory_region_name(parsed_region),
+                        "address": address,
+                        "len": bytes.len(),
+                        "bytes": bytes
+                    })).unwrap_or_else(|_| "{}".to_string())
+                }]
+            }))
+        }
+        _ if uri.starts_with("gbbrain://disasm/") => {
+            let (address, count) = parse_disasm_uri(uri)?;
+            let machine = state.machine_ref()?;
+            let instructions: Vec<Value> = Machine::disassemble_range(machine, address, count)
+                .into_iter()
+                .map(|inst| {
+                    json!({
+                        "address": inst.address,
+                        "bytes": inst.bytes,
+                        "text": inst.text,
+                        "len": inst.len
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "application/json",
+                    "text": serde_json::to_string_pretty(&instructions)
+                        .unwrap_or_else(|_| "[]".to_string())
+                }]
+            }))
+        }
+        _ => Err(format!("unsupported resource uri: {uri}")),
+    }
+}
+
+fn parse_memory_uri(uri: &str) -> Result<(String, u32, usize), String> {
+    let parts: Vec<&str> = uri.trim_start_matches("gbbrain://memory/").split('/').collect();
+    if parts.len() != 3 {
+        return Err(format!("invalid memory resource uri: {uri}"));
+    }
+    let region = parts[0].to_string();
+    let address = parts[1]
+        .parse::<u32>()
+        .map_err(|_| format!("invalid memory address in uri: {uri}"))?;
+    let len = parts[2]
+        .parse::<usize>()
+        .map_err(|_| format!("invalid memory length in uri: {uri}"))?;
+    Ok((region, address, len))
+}
+
+fn parse_disasm_uri(uri: &str) -> Result<(u16, usize), String> {
+    let parts: Vec<&str> = uri.trim_start_matches("gbbrain://disasm/").split('/').collect();
+    if parts.len() != 2 {
+        return Err(format!("invalid disassembly resource uri: {uri}"));
+    }
+    let address = parts[0]
+        .parse::<u16>()
+        .map_err(|_| format!("invalid disassembly address in uri: {uri}"))?;
+    let count = parts[1]
+        .parse::<usize>()
+        .map_err(|_| format!("invalid disassembly count in uri: {uri}"))?;
+    Ok((address, count))
+}
+
+fn mcp_tool_response(result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "result": {
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+            }]
+        }
+    })
+}
+
+fn write_mcp_response(output: &mut impl Write, id: Option<Value>, payload: Value) -> io::Result<()> {
+    let mut response = payload;
+    if let Some(id) = id {
+        response["id"] = id;
+    }
+    serde_json::to_writer(&mut *output, &response)?;
+    output.write_all(b"\n")?;
+    output.flush()
+}
+
+fn mcp_tools() -> Value {
+    json!([
+        tool_spec("load_rom", "Load a Game Boy ROM into the emulator", json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "model": {"type": "string"},
+                "bootrom_path": {"type": "string"},
+                "cart_state_path": {"type": "string"}
+            },
+            "required": ["path"]
+        })),
+        tool_spec("snapshot", "Return a snapshot of the current machine state", json!({"type":"object","properties":{}})),
+        tool_spec("step", "Step the machine by N instructions", json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer", "minimum": 1}}
+        })),
+        tool_spec("run_for_cycles", "Run until a cycle budget is exhausted", json!({
+            "type": "object",
+            "properties": {"cycles": {"type": "integer", "minimum": 1}},
+            "required": ["cycles"]
+        })),
+        tool_spec("run_for_frames", "Run until a frame budget is exhausted", json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer", "minimum": 1}},
+            "required": ["count"]
+        })),
+        tool_spec("run", "Run until stop or instruction budget", json!({
+            "type": "object",
+            "properties": {"max_instructions": {"type": "integer", "minimum": 1}}
+        })),
+        tool_spec("inspect_memory", "Inspect a memory region", json!({
+            "type": "object",
+            "properties": {
+                "region": {"type": "string"},
+                "address": {"type": "integer", "minimum": 0},
+                "len": {"type": "integer", "minimum": 0}
+            },
+            "required": ["region", "address", "len"]
+        })),
+        tool_spec("read_address", "Read a system address", json!({
+            "type": "object",
+            "properties": {"address": {"type": "integer", "minimum": 0}},
+            "required": ["address"]
+        })),
+        tool_spec("write_address", "Write a system address", json!({
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer", "minimum": 0},
+                "value": {"type": "integer", "minimum": 0}
+            },
+            "required": ["address", "value"]
+        })),
+        tool_spec("set_input", "Set pressed buttons", json!({
+            "type": "object",
+            "properties": {"buttons": {"type": "array", "items": {"type": "string"}}}
+        })),
+        tool_spec("get_input", "Get pressed buttons", json!({"type":"object","properties":{}})),
+        tool_spec("disassemble", "Disassemble a range of code", json!({
+            "type": "object",
+            "properties": {
+                "address": {"type": "integer", "minimum": 0},
+                "count": {"type": "integer", "minimum": 1}
+            },
+            "required": ["address"]
+        })),
+        tool_spec("save_snapshot", "Serialize the full machine state", json!({"type":"object","properties":{}})),
+        tool_spec("load_snapshot", "Restore the full machine state", json!({
+            "type": "object",
+            "properties": {"bytes_base64": {"type": "string"}},
+            "required": ["bytes_base64"]
+        })),
+        tool_spec("save_cart_state", "Serialize persistent cartridge state", json!({"type":"object","properties":{}})),
+        tool_spec("load_cart_state", "Restore persistent cartridge state", json!({
+            "type": "object",
+            "properties": {"bytes_base64": {"type": "string"}},
+            "required": ["bytes_base64"]
+        })),
+        tool_spec("save_cart_state_file", "Write persistent cartridge state to a file", json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        })),
+        tool_spec("load_cart_state_file", "Load persistent cartridge state from a file", json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        })),
+        tool_spec("export_save_ram", "Export cartridge save RAM", json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        })),
+        tool_spec("import_save_ram", "Import cartridge save RAM", json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        })),
+        tool_spec("add_breakpoint", "Add a breakpoint", json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string"},
+                "address": {"type": "integer", "minimum": 0}
+            },
+            "required": ["kind", "address"]
+        })),
+        tool_spec("clear_breakpoints", "Clear all breakpoints", json!({"type":"object","properties":{}})),
+        tool_spec("get_trace", "Return recent trace entries", json!({
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1}}
+        })),
+        tool_spec("clear_trace", "Clear the trace buffer", json!({"type":"object","properties":{}})),
+        tool_spec("get_serial_output", "Return captured serial output", json!({
+            "type": "object",
+            "properties": {"encoding": {"type": "string"}}
+        })),
+        tool_spec("clear_serial_output", "Clear captured serial output", json!({"type":"object","properties":{}})),
+        tool_spec("render_frame", "Render the current frame buffer", json!({
+            "type": "object",
+            "properties": {
+                "target": {"type": "string"},
+                "encoding": {"type": "string"}
+            }
+        })),
+        tool_spec("reset", "Reset the machine", json!({"type":"object","properties":{}})),
+        tool_spec("cartridge_info", "Return loaded cartridge metadata", json!({"type":"object","properties":{}})),
+        tool_spec("shutdown", "Shutdown the server", json!({"type":"object","properties":{}}))
+    ])
+}
+
+fn tool_spec(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema
+    })
+}
+
+fn call_mcp_tool(state: &mut SessionState, name: &str, arguments: Value) -> Result<Value, String> {
+    match name {
+        "load_rom" => {
+            let path = required_string(&arguments, "path")?;
+            let model = optional_string(&arguments, "model");
+            let bootrom_path = optional_string(&arguments, "bootrom_path");
+            let cart_state_path = optional_string(&arguments, "cart_state_path");
+            state.load_rom(path, model, bootrom_path, cart_state_path)
+        }
+        "snapshot" => {
+            let machine = state.machine_ref()?;
+            Ok(json!({ "snapshot": SessionState::snapshot_dto(machine) }))
+        }
+        "step" => state.step(optional_u64(&arguments, "count").unwrap_or(1)),
+        "run_for_cycles" => state.run_for_cycles(required_u64(&arguments, "cycles")?),
+        "run_for_frames" => state.run_for_frames(required_u64(&arguments, "count")?),
+        "run" => state.run(optional_u64(&arguments, "max_instructions")),
+        "inspect_memory" => state.inspect_memory(
+            required_string(&arguments, "region")?,
+            required_u32(&arguments, "address")?,
+            required_usize(&arguments, "len")?,
+        ),
+        "read_address" => state.read_address(required_u32(&arguments, "address")?),
+        "write_address" => state.write_address(
+            required_u32(&arguments, "address")?,
+            required_u32(&arguments, "value")?,
+        ),
+        "set_input" => state.set_input(optional_string_array(&arguments, "buttons")),
+        "get_input" => state.get_input(),
+        "disassemble" => state.disassemble(
+            required_u32(&arguments, "address")?,
+            optional_usize(&arguments, "count").unwrap_or(8),
+        ),
+        "save_snapshot" => state.save_snapshot(),
+        "load_snapshot" => state.load_snapshot(required_string(&arguments, "bytes_base64")?),
+        "save_cart_state" => state.save_cart_state(),
+        "load_cart_state" => state.load_cart_state(required_string(&arguments, "bytes_base64")?),
+        "save_cart_state_file" => state.save_cart_state_file(required_string(&arguments, "path")?),
+        "load_cart_state_file" => state.load_cart_state_file(required_string(&arguments, "path")?),
+        "export_save_ram" => state.export_save_ram(required_string(&arguments, "path")?),
+        "import_save_ram" => state.import_save_ram(required_string(&arguments, "path")?),
+        "add_breakpoint" => {
+            let kind = required_string(&arguments, "kind")?;
+            let address = required_u32(&arguments, "address")?;
+            state.add_breakpoint(&kind, address)
+        }
+        "clear_breakpoints" => {
+            let machine = state.machine_mut()?;
+            machine
+                .clear_breakpoints()
+                .map_err(|error| error.to_string())?;
+            Ok(json!({"cleared": true}))
+        }
+        "get_trace" => state.get_trace(optional_usize(&arguments, "limit")),
+        "clear_trace" => {
+            let machine = state.machine_mut()?;
+            machine.clear_trace();
+            Ok(json!({"cleared": true}))
+        }
+        "get_serial_output" => state.get_serial_output(optional_string(&arguments, "encoding")),
+        "clear_serial_output" => {
+            let machine = state.machine_mut()?;
+            machine.clear_serial_output();
+            Ok(json!({"cleared": true}))
+        }
+        "render_frame" => state.render_frame(optional_string(&arguments, "target"), optional_string(&arguments, "encoding")),
+        "reset" => {
+            let machine = state.machine_mut()?;
+            machine.reset().map_err(|error| error.to_string())?;
+            Ok(json!({ "snapshot": SessionState::snapshot_dto(machine) }))
+        }
+        "cartridge_info" => state.cartridge_info(),
+        "shutdown" => state.shutdown(),
+        _ => Err(format!("unsupported tool: {name}")),
+    }
+}
+
+fn required_string(arguments: &Value, key: &str) -> Result<String, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+        .ok_or_else(|| format!("missing string argument: {key}"))
+}
+
+fn optional_string(arguments: &Value, key: &str) -> Option<String> {
+    arguments.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+fn optional_string_array(arguments: &Value, key: &str) -> Vec<String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn required_u32(arguments: &Value, key: &str) -> Result<u32, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| format!("missing u32 argument: {key}"))
+}
+
+fn required_usize(arguments: &Value, key: &str) -> Result<usize, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("missing usize argument: {key}"))
+}
+
+fn optional_usize(arguments: &Value, key: &str) -> Option<usize> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn required_u64(arguments: &Value, key: &str) -> Result<u64, String> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("missing u64 argument: {key}"))
+}
+
+fn optional_u64(arguments: &Value, key: &str) -> Option<u64> {
+    arguments.get(key).and_then(Value::as_u64)
 }
 
 #[derive(Debug)]
@@ -807,9 +1474,7 @@ struct SessionState {
 impl SessionState {
     fn flush_cart_state_if_configured(&self) -> Result<(), String> {
         if let (Some(machine), Some(path)) = (&self.machine, &self.cart_state_path) {
-            let bytes = machine
-                .save_cartridge_state()
-                .map_err(|error| error.to_string())?;
+            let bytes = Machine::save_cartridge_state(machine).map_err(|error| error.to_string())?;
             fs::write(path, bytes).map_err(|error| {
                 format!(
                     "failed to write cartridge state '{}': {error}",
@@ -838,6 +1503,7 @@ impl SessionState {
                     "reset",
                     "step",
                     "run_for_cycles",
+                    "run_for_frames",
                     "run_for_instructions",
                     "run",
                     "snapshot",
@@ -883,6 +1549,7 @@ impl SessionState {
             }
             Request::Step { count } => self.step(count.unwrap_or(1)),
             Request::RunForCycles { cycles } => self.run_for_cycles(cycles),
+            Request::RunForFrames { count } => self.run_for_frames(count),
             Request::RunForInstructions { count } => self.run_for_instructions(count),
             Request::Run { max_instructions } => self.run(max_instructions),
             Request::Snapshot => {
@@ -974,8 +1641,9 @@ impl SessionState {
         let warnings = synthetic_bootrom_warnings(&rom, bootrom_path.as_deref());
         let mut machine = GbMachine::new_with_model_and_bootrom(rom, model, bootrom)
             .map_err(|error| error.to_string())?;
+        let cartridge = machine.cartridge_info();
         let effective_cart_state_path = cart_state_path.as_ref().map(PathBuf::from).or_else(|| {
-            if machine.cartridge_has_battery() || machine.cartridge_has_rtc() {
+            if cartridge.has_battery || cartridge.has_rtc {
                 Some(default_cart_state_path_for_rom(Path::new(&path)))
             } else {
                 None
@@ -989,7 +1657,7 @@ impl SessionState {
                         path.display()
                     )
                 })?;
-                machine.load_cartridge_state(&bytes).map_err(|error| {
+                Machine::load_cartridge_state(&mut machine, &bytes).map_err(|error| {
                     format!(
                         "failed to load cartridge state '{}': {error}",
                         path.display()
@@ -1001,33 +1669,24 @@ impl SessionState {
         self.rom_path = Some(PathBuf::from(&path));
         self.cart_state_path = effective_cart_state_path.clone();
         let machine = self.machine.as_ref().expect("machine just loaded");
+        let cartridge = machine.cartridge_info();
         let snapshot = Self::snapshot_dto(machine);
 
         Ok(json!({
             "platform": "gb",
-            "model": machine.model().as_name(),
+            "model": machine.model_name(),
             "rom_path": path,
             "bootrom_path": bootrom_path,
             "cart_state_path": effective_cart_state_path,
             "warnings": warnings,
-            "cartridge": {
-                "title": machine.cartridge_title(),
-                "type_code": machine.cartridge_type_code(),
-                "has_battery": machine.cartridge_has_battery(),
-                "has_rtc": machine.cartridge_has_rtc()
-            },
+            "cartridge": cartridge,
             "snapshot": snapshot
         }))
     }
 
     fn cartridge_info(&self) -> Result<Value, String> {
         let machine = self.machine_ref()?;
-        Ok(json!({
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code(),
-            "has_battery": machine.cartridge_has_battery(),
-            "has_rtc": machine.cartridge_has_rtc()
-        }))
+        Ok(json!(machine.cartridge_info()))
     }
 
     fn step(&mut self, count: u64) -> Result<Value, String> {
@@ -1076,7 +1735,15 @@ impl SessionState {
         let machine = self.machine_mut()?;
         let start_instruction_counter = machine.snapshot().instruction_counter;
         let start_cycle_counter = machine.debug_state().cycle_counter;
-        let stop_reason = execute_for_cycles(machine, cycles)?;
+        let stop_reason = machine
+            .run_for_cycles(cycles)
+            .map_err(|error| error.to_string())?
+            .stop_reason;
+        let stop_reason = if stop_reason == StopReason::RunLimitReached {
+            "cycle_budget_exhausted"
+        } else {
+            stop_reason_name(stop_reason)
+        };
 
         Ok(json!({
             "stop_reason": stop_reason,
@@ -1086,6 +1753,28 @@ impl SessionState {
                 "kind": kind,
                 "address": address
             })),
+            "snapshot": Self::snapshot_dto(machine)
+        }))
+    }
+
+    fn run_for_frames(&mut self, count: u64) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let start_instruction_counter = machine.snapshot().instruction_counter;
+        let start_cycle_counter = machine.debug_state().cycle_counter;
+        let stop_reason = machine
+            .run_for_frames(count)
+            .map_err(|error| error.to_string())?
+            .stop_reason;
+        let stop_reason = if stop_reason == StopReason::RunLimitReached {
+            "frame_budget_exhausted"
+        } else {
+            stop_reason_name(stop_reason)
+        };
+
+        Ok(json!({
+            "stop_reason": stop_reason,
+            "cycles_elapsed": machine.debug_state().cycle_counter - start_cycle_counter,
+            "instructions_retired": machine.snapshot().instruction_counter - start_instruction_counter,
             "snapshot": Self::snapshot_dto(machine)
         }))
     }
@@ -1133,7 +1822,7 @@ impl SessionState {
         let machine = self.machine_mut()?;
         let address =
             u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
-        let value = machine.read_system_address(address);
+        let value = Machine::read_address(machine, address);
 
         Ok(json!({
             "address": address,
@@ -1146,8 +1835,8 @@ impl SessionState {
         let address =
             u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
         let value = u8::try_from(value).map_err(|_| format!("value out of range: {value}"))?;
-        machine.write_system_address(address, value);
-        let read_back = machine.read_system_address(address);
+        Machine::write_address(machine, address, value);
+        let read_back = Machine::read_address(machine, address);
 
         Ok(json!({
             "address": address,
@@ -1160,8 +1849,7 @@ impl SessionState {
         let machine = self.machine_ref()?;
         let address =
             u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
-        let instructions: Vec<DisassemblyDto> = machine
-            .disassemble_range(address, count)
+        let instructions: Vec<DisassemblyDto> = Machine::disassemble_range(machine, address, count)
             .into_iter()
             .map(DisassemblyDto::from)
             .collect();
@@ -1187,16 +1875,16 @@ impl SessionState {
         }
         machine.set_pressed_buttons_mask(mask);
         Ok(json!({
-            "buttons": machine.pressed_button_names(),
-            "p1": machine.read_system_address(0xFF00)
+            "buttons": pressed_button_names_from_mask(machine.pressed_buttons_mask()),
+            "p1": Machine::read_address(machine, 0xFF00)
         }))
     }
 
     fn get_input(&mut self) -> Result<Value, String> {
         let machine = self.machine_mut()?;
         Ok(json!({
-            "buttons": machine.pressed_button_names(),
-            "p1": machine.read_system_address(0xFF00)
+            "buttons": pressed_button_names_from_mask(machine.pressed_buttons_mask()),
+            "p1": Machine::read_address(machine, 0xFF00)
         }))
     }
 
@@ -1215,9 +1903,11 @@ impl SessionState {
             .map_err(|error| format!("invalid base64 snapshot: {error}"))?;
         let machine = GbMachine::load_state(&bytes).map_err(|error| error.to_string())?;
         self.machine = Some(machine);
+        let machine = self.machine.as_ref().expect("snapshot just loaded");
         Ok(json!({
             "platform": "gb",
-            "snapshot": Self::snapshot_dto(self.machine.as_ref().expect("snapshot just loaded"))
+            "cartridge": machine.cartridge_info(),
+            "snapshot": Self::snapshot_dto(machine)
         }))
     }
 
@@ -1237,26 +1927,22 @@ impl SessionState {
         let bytes = BASE64
             .decode(bytes_base64)
             .map_err(|error| format!("invalid base64 cartridge state: {error}"))?;
-        machine
-            .load_cartridge_state(&bytes)
-            .map_err(|error| error.to_string())?;
+        Machine::load_cartridge_state(machine, &bytes).map_err(|error| error.to_string())?;
+        let cartridge = machine.cartridge_info();
         Ok(json!({
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code()
+            "cartridge": cartridge
         }))
     }
 
     fn save_cart_state_file(&self, path: String) -> Result<Value, String> {
         let machine = self.machine_ref()?;
-        let bytes = machine
-            .save_cartridge_state()
-            .map_err(|error| error.to_string())?;
+        let bytes = Machine::save_cartridge_state(machine).map_err(|error| error.to_string())?;
         fs::write(&path, bytes)
             .map_err(|error| format!("failed to write cartridge state '{path}': {error}"))?;
+        let cartridge = machine.cartridge_info();
         Ok(json!({
             "path": path,
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code()
+            "cartridge": cartridge
         }))
     }
 
@@ -1264,25 +1950,23 @@ impl SessionState {
         let machine = self.machine_mut()?;
         let bytes = fs::read(&path)
             .map_err(|error| format!("failed to read cartridge state '{path}': {error}"))?;
-        machine
-            .load_cartridge_state(&bytes)
-            .map_err(|error| error.to_string())?;
+        Machine::load_cartridge_state(machine, &bytes).map_err(|error| error.to_string())?;
+        let cartridge = machine.cartridge_info();
         Ok(json!({
             "path": path,
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code()
+            "cartridge": cartridge
         }))
     }
 
     fn export_save_ram(&self, path: String) -> Result<Value, String> {
         let machine = self.machine_ref()?;
-        let bytes = machine.save_cartridge_ram();
+        let bytes = Machine::save_cartridge_ram(machine);
         fs::write(&path, bytes)
             .map_err(|error| format!("failed to write save RAM '{path}': {error}"))?;
+        let cartridge = machine.cartridge_info();
         Ok(json!({
             "path": path,
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code()
+            "cartridge": cartridge
         }))
     }
 
@@ -1290,13 +1974,11 @@ impl SessionState {
         let machine = self.machine_mut()?;
         let bytes = fs::read(&path)
             .map_err(|error| format!("failed to read save RAM '{path}': {error}"))?;
-        machine
-            .load_cartridge_ram(&bytes)
-            .map_err(|error| error.to_string())?;
+        Machine::load_cartridge_ram(machine, &bytes).map_err(|error| error.to_string())?;
+        let cartridge = machine.cartridge_info();
         Ok(json!({
             "path": path,
-            "title": machine.cartridge_title(),
-            "type_code": machine.cartridge_type_code()
+            "cartridge": cartridge
         }))
     }
 
@@ -1429,6 +2111,9 @@ enum Request {
     },
     RunForCycles {
         cycles: u64,
+    },
+    RunForFrames {
+        count: u64,
     },
     RunForInstructions {
         count: u64,
@@ -1582,6 +2267,7 @@ struct DebugStateDto {
     cycle_counter: u64,
     div_counter: u16,
     ppu_cycle_counter: u16,
+    frame_counter: u64,
     ime: bool,
     ie: u8,
     if_reg: u8,
@@ -1596,6 +2282,7 @@ impl From<DebugState> for DebugStateDto {
             cycle_counter: state.cycle_counter,
             div_counter: state.div_counter,
             ppu_cycle_counter: state.ppu_cycle_counter,
+            frame_counter: state.frame_counter,
             ime: state.ime,
             ie: state.ie,
             if_reg: state.if_reg,
@@ -1706,6 +2393,25 @@ fn memory_region_name(region: MemoryRegion) -> &'static str {
     }
 }
 
+fn pressed_button_names_from_mask(mask: u8) -> Vec<&'static str> {
+    let mut buttons = Vec::new();
+    for (bit, name) in [
+        (0, "right"),
+        (1, "left"),
+        (2, "up"),
+        (3, "down"),
+        (4, "a"),
+        (5, "b"),
+        (6, "select"),
+        (7, "start"),
+    ] {
+        if mask & (1 << bit) != 0 {
+            buttons.push(name);
+        }
+    }
+    buttons
+}
+
 fn parse_breakpoint(kind: &str, address: u32) -> Result<Breakpoint, String> {
     match kind {
         "pc" => Ok(Breakpoint::ProgramCounter(address)),
@@ -1747,25 +2453,4 @@ fn execute_for_instructions(machine: &mut GbMachine, count: u64) -> Result<StopR
         }
     }
     Ok(StopReason::RunLimitReached)
-}
-
-fn execute_for_cycles(machine: &mut GbMachine, cycles: u64) -> Result<&'static str, String> {
-    let start_cycles = machine.debug_state().cycle_counter;
-
-    while machine
-        .debug_state()
-        .cycle_counter
-        .saturating_sub(start_cycles)
-        < cycles
-    {
-        let result = machine
-            .step_instruction()
-            .map_err(|error| error.to_string())?;
-        match result.stop_reason {
-            StopReason::StepComplete | StopReason::Halted => {}
-            other => return Ok(stop_reason_name(other)),
-        }
-    }
-
-    Ok("cycle_budget_exhausted")
 }

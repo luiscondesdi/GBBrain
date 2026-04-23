@@ -449,6 +449,7 @@ pub struct GbMachine {
     div_counter: u16,
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
+    frame_counter: u64,
     ppu_mode: PpuMode,
     ppu_mode_cycles_remaining: u16,
     dma_source: u16,
@@ -467,6 +468,7 @@ pub struct DebugState {
     pub cycle_counter: u64,
     pub div_counter: u16,
     pub ppu_cycle_counter: u16,
+    pub frame_counter: u64,
     pub ppu_mode: u8,
     pub ime: bool,
     pub ie: u8,
@@ -508,6 +510,7 @@ struct SnapshotState {
     div_counter: u16,
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
+    frame_counter: u64,
     #[serde(default = "default_ppu_mode")]
     ppu_mode: PpuMode,
     #[serde(default = "default_ppu_mode_cycles")]
@@ -2085,6 +2088,7 @@ impl GbMachine {
                 if next_ly > 153 {
                     self.io[ly_index] = 0;
                     self.switch_ppu_mode(PpuMode::AccessOam);
+                    self.frame_counter = self.frame_counter.wrapping_add(1);
                 } else {
                     self.io[ly_index] = next_ly;
                     self.ppu_mode_cycles_remaining = PPU_VBLANK_LINE_CYCLES;
@@ -2160,10 +2164,10 @@ impl GbMachine {
         self.cartridge.tick(cycles);
         for _ in 0..cycles {
             self.cycle_counter += 1;
+            self.step_timer_cycle();
             if self.cycle_counter % 4 == 0 {
                 self.step_dma_mcycle();
                 self.step_ppu_cycle();
-                self.step_timer_cycle();
             }
         }
     }
