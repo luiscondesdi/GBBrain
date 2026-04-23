@@ -16,6 +16,7 @@ Recently re-verified command paths:
 
 - `help`
 - `load_rom`
+- `cartridge_info`
 - `reset`
 - `step`
 - `run_for_cycles`
@@ -25,15 +26,25 @@ Recently re-verified command paths:
 - `inspect_memory`
 - `read_address`
 - `write_address`
+- `set_input`
+- `get_input`
 - `disassemble`
 - `save_snapshot`
 - `load_snapshot`
+- `save_cart_state`
+- `load_cart_state`
+- `save_cart_state_file`
+- `load_cart_state_file`
+- `export_save_ram`
+- `import_save_ram`
 - `add_breakpoint`
 - `clear_breakpoints`
 - `get_trace`
 - `clear_trace`
 - `get_serial_output`
 - `clear_serial_output`
+- `set_input`
+- `get_input`
 - `render_frame`
 - `shutdown`
 

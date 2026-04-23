@@ -8,6 +8,15 @@ use gbbrain_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod cartridge;
+mod hardware;
+mod state;
+#[cfg(test)]
+mod tests;
+mod traits_impl;
+
+use cartridge::Cartridge;
+
 const ROM_BANK_0_END: u16 = 0x3FFF;
 const ROM_BANK_N_END: u16 = 0x7FFF;
 const VRAM_START: u16 = 0x8000;
@@ -45,6 +54,10 @@ const INTERRUPT_VECTORS: &[(u8, u16)] = &[
     (0x08, 0x0058),
     (0x10, 0x0060),
 ];
+const PPU_ACCESS_OAM_CYCLES: u16 = 20;
+const PPU_ACCESS_VRAM_CYCLES: u16 = 43;
+const PPU_HBLANK_CYCLES: u16 = 50;
+const PPU_VBLANK_LINE_CYCLES: u16 = 114;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Bus {
@@ -58,7 +71,20 @@ enum Bus {
 enum OamCorruptionKind {
     Read,
     Write,
-    ReadWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum PpuMode {
+    HBlank = 0,
+    VBlank = 1,
+    AccessOam = 2,
+    AccessVram = 3,
+}
+
+impl PpuMode {
+    fn bits(self) -> u8 {
+        self as u8
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -70,7 +96,33 @@ enum TimaReloadState {
 #[derive(Debug, Clone)]
 pub enum GbError {
     EmptyRom,
-    UnsupportedOpcode { opcode: u8, pc: u16 },
+    InvalidBootromSize(usize),
+    InvalidRomLength(usize),
+    UnsupportedCartridgeType(u8),
+    UnsupportedRomSize(u8),
+    UnsupportedRamSize(u8),
+    RomSizeMismatch {
+        header_size: usize,
+        actual_size: usize,
+    },
+    MissingRamForCartridge(u8),
+    UnexpectedRamSize {
+        cartridge_type: u8,
+        ram_size: u8,
+    },
+    PersistentStateRamSizeMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PersistentStateCartridgeMismatch,
+    PersistentStateRtcMismatch,
+    IllegalOpcode {
+        opcode: u8,
+        pc: u16,
+    },
+    StopInstruction {
+        pc: u16,
+    },
     StackOverflow(u16),
 }
 
@@ -78,8 +130,56 @@ impl fmt::Display for GbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRom => f.write_str("ROM is empty"),
-            Self::UnsupportedOpcode { opcode, pc } => {
-                write!(f, "unsupported opcode 0x{opcode:02x} at PC 0x{pc:04x}")
+            Self::InvalidBootromSize(size) => {
+                write!(f, "boot ROM must be exactly 256 bytes, got {size}")
+            }
+            Self::InvalidRomLength(size) => {
+                write!(
+                    f,
+                    "ROM length must be a non-zero multiple of 16 KiB, got {size}"
+                )
+            }
+            Self::UnsupportedCartridgeType(kind) => {
+                write!(f, "unsupported cartridge type 0x{kind:02x}")
+            }
+            Self::UnsupportedRomSize(size) => {
+                write!(f, "unsupported ROM size header 0x{size:02x}")
+            }
+            Self::UnsupportedRamSize(size) => {
+                write!(f, "unsupported RAM size header 0x{size:02x}")
+            }
+            Self::RomSizeMismatch {
+                header_size,
+                actual_size,
+            } => write!(
+                f,
+                "ROM size header expects {header_size} bytes, got {actual_size}"
+            ),
+            Self::MissingRamForCartridge(kind) => {
+                write!(f, "cartridge type 0x{kind:02x} requires external RAM")
+            }
+            Self::UnexpectedRamSize {
+                cartridge_type,
+                ram_size,
+            } => write!(
+                f,
+                "cartridge type 0x{cartridge_type:02x} should not declare RAM size 0x{ram_size:02x}"
+            ),
+            Self::PersistentStateRamSizeMismatch { expected, actual } => write!(
+                f,
+                "persistent cartridge RAM size mismatch: expected {expected} bytes, got {actual}"
+            ),
+            Self::PersistentStateCartridgeMismatch => {
+                f.write_str("persistent cartridge state does not match loaded cartridge")
+            }
+            Self::PersistentStateRtcMismatch => {
+                f.write_str("persistent cartridge RTC state does not match loaded cartridge")
+            }
+            Self::IllegalOpcode { opcode, pc } => {
+                write!(f, "illegal opcode 0x{opcode:02x} at PC 0x{pc:04x}")
+            }
+            Self::StopInstruction { pc } => {
+                write!(f, "STOP instruction encountered at PC 0x{pc:04x}")
             }
             Self::StackOverflow(address) => {
                 write!(f, "stack access failed at address 0x{address:04x}")
@@ -90,8 +190,7 @@ impl fmt::Display for GbError {
 
 impl Error for GbError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 struct Registers {
     a: u8,
     f: u8,
@@ -158,18 +257,21 @@ impl Registers {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum WatchpointKind {
     Read,
     Write,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct WatchpointHit {
     kind: WatchpointKind,
     address: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct JoypadState {
+    pressed: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,10 +427,11 @@ fn cb_name(opcode: u8) -> String {
 
 /// Minimal DMG machine with a stable control and inspection surface.
 pub struct GbMachine {
-    rom: Vec<u8>,
-    rom_bank: u16,
+    cartridge: Cartridge,
+    bootrom: Option<Box<[u8; 0x100]>>,
+    bootrom_active: bool,
     model: GbModel,
-    eram: [u8; 0x2000],
+    joypad: JoypadState,
     vram: [u8; 0x2000],
     wram: [u8; 0x2000],
     oam: [u8; 0xA0],
@@ -346,11 +449,14 @@ pub struct GbMachine {
     div_counter: u16,
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
+    ppu_mode: PpuMode,
+    ppu_mode_cycles_remaining: u16,
     dma_source: u16,
     dma_active: bool,
     dma_requested_source: Option<u16>,
     dma_starting_source: Option<u16>,
     dma_next_byte: u16,
+    pending_t34_interrupts: u8,
     pending_watchpoint: Option<WatchpointHit>,
     trace: VecDeque<TraceEntry>,
     serial_output: Vec<u8>,
@@ -361,6 +467,7 @@ pub struct DebugState {
     pub cycle_counter: u64,
     pub div_counter: u16,
     pub ppu_cycle_counter: u16,
+    pub ppu_mode: u8,
     pub ime: bool,
     pub ie: u8,
     pub if_reg: u8,
@@ -371,10 +478,14 @@ pub struct DebugState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SnapshotState {
-    rom: Vec<u8>,
-    rom_bank: u16,
+    cartridge: Cartridge,
+    #[serde(default)]
+    bootrom: Option<Vec<u8>>,
+    #[serde(default)]
+    bootrom_active: bool,
     model: GbModel,
-    eram: Vec<u8>,
+    #[serde(default)]
+    joypad: JoypadState,
     vram: Vec<u8>,
     wram: Vec<u8>,
     oam: Vec<u8>,
@@ -397,12 +508,22 @@ struct SnapshotState {
     div_counter: u16,
     tima_reload_state: Option<TimaReloadState>,
     ppu_cycle_counter: u16,
+    #[serde(default = "default_ppu_mode")]
+    ppu_mode: PpuMode,
+    #[serde(default = "default_ppu_mode_cycles")]
+    ppu_mode_cycles_remaining: u16,
     dma_source: u16,
     dma_active: bool,
     dma_requested_source: Option<u16>,
     dma_starting_source: Option<u16>,
     dma_next_byte: u16,
+    #[serde(default)]
+    pending_t34_interrupts: u8,
     pending_watchpoint: Option<WatchpointHit>,
+    #[serde(default)]
+    deferred_interrupt_flags: u8,
+    #[serde(default)]
+    deferred_interrupt_delay: u8,
     trace: Vec<SnapshotTraceEntry>,
     serial_output: Vec<u8>,
 }
@@ -440,10 +561,19 @@ struct SnapshotTraceEntry {
     stop_reason: u8,
 }
 
+fn default_ppu_mode() -> PpuMode {
+    PpuMode::HBlank
+}
+
+fn default_ppu_mode_cycles() -> u16 {
+    PPU_ACCESS_OAM_CYCLES
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum ExecState {
     Running,
     Halt,
+    Stop,
     InterruptDispatch,
 }
 
@@ -532,864 +662,6 @@ enum Out8 {
 }
 
 impl GbMachine {
-    pub fn new(rom: Vec<u8>) -> Result<Self, GbError> {
-        Self::new_with_model(rom, GbModel::Dmg)
-    }
-
-    pub fn new_with_model(rom: Vec<u8>, model: GbModel) -> Result<Self, GbError> {
-        if rom.is_empty() {
-            return Err(GbError::EmptyRom);
-        }
-
-        let mut machine = Self {
-            rom,
-            rom_bank: 1,
-            model,
-            eram: [0; 0x2000],
-            vram: [0; 0x2000],
-            wram: [0; 0x2000],
-            oam: [0; 0xA0],
-            io: [0; 0x80],
-            hram: [0; 0x7F],
-            ie: 0,
-            registers: Registers {
-                sp: 0xFFFE,
-                pc: 0x0100,
-                ..Registers::default()
-            },
-            prefetched_pc: None,
-            prefetched_opcode: None,
-            breakpoints: Vec::new(),
-            ime: false,
-            exec_state: ExecState::Running,
-            instruction_counter: 0,
-            cycle_counter: 0,
-            div_counter: 0,
-            tima_reload_state: None,
-            ppu_cycle_counter: 0,
-            dma_source: 0,
-            dma_active: false,
-            dma_requested_source: None,
-            dma_starting_source: None,
-            dma_next_byte: 0,
-            pending_watchpoint: None,
-            trace: VecDeque::with_capacity(TRACE_CAPACITY),
-            serial_output: Vec::new(),
-        };
-        machine.reset_state();
-        Ok(machine)
-    }
-
-    fn reset_state(&mut self) {
-        self.rom_bank = 1;
-        self.eram.fill(0);
-        self.vram.fill(0);
-        self.wram.fill(0);
-        self.oam.fill(0);
-        self.io.fill(0xFF);
-        self.hram.fill(0);
-        self.ie = 0;
-        self.registers = self.model_boot_registers();
-        self.prefetched_pc = None;
-        self.prefetched_opcode = None;
-        self.breakpoints.clear();
-        self.ime = false;
-        self.exec_state = ExecState::Running;
-        self.instruction_counter = 0;
-        self.cycle_counter = 0;
-        self.div_counter = self.model_boot_div_counter();
-        self.tima_reload_state = None;
-        self.ppu_cycle_counter = 0;
-        self.dma_source = 0;
-        self.dma_active = false;
-        self.dma_requested_source = None;
-        self.dma_starting_source = None;
-        self.dma_next_byte = 0;
-        self.pending_watchpoint = None;
-        self.trace.clear();
-        self.serial_output.clear();
-        self.io[0x00] = self.model_boot_p1();
-        self.io[(SERIAL_SB - IO_START) as usize] = 0x00;
-        self.io[(SERIAL_SC - IO_START) as usize] = 0x7E;
-        self.io[(TIMER_DIV - IO_START) as usize] = (self.div_counter >> 8) as u8;
-        self.io[(TIMER_TIMA - IO_START) as usize] = 0x00;
-        self.io[(TIMER_TMA - IO_START) as usize] = 0x00;
-        self.io[(TIMER_TAC - IO_START) as usize] = 0xF8;
-        self.io[(IF_REGISTER - IO_START) as usize] = 0xE1;
-        self.io[0x10] = 0x80; // NR10
-        self.io[0x11] = 0xBF; // NR11
-        self.io[0x12] = 0xF3; // NR12
-        self.io[0x13] = 0xFF; // NR13
-        self.io[0x14] = 0xBF; // NR14
-        self.io[0x16] = 0x3F; // NR21
-        self.io[0x17] = 0x00; // NR22
-        self.io[0x18] = 0xFF; // NR23
-        self.io[0x19] = 0xBF; // NR24
-        self.io[0x1A] = 0x7F; // NR30
-        self.io[0x1B] = 0xFF; // NR31
-        self.io[0x1C] = 0x9F; // NR32
-        self.io[0x1D] = 0xFF; // NR33
-        self.io[0x1E] = 0xBF; // NR34
-        self.io[0x20] = 0xFF; // NR41
-        self.io[0x21] = 0x00; // NR42
-        self.io[0x22] = 0x00; // NR43
-        self.io[0x23] = 0xBF; // NR44
-        self.io[0x24] = 0x77; // NR50
-        self.io[0x25] = 0xF3; // NR51
-        self.io[0x26] = self.model_boot_nr52(); // NR52
-        self.io[(LCDC_REGISTER - IO_START) as usize] = self.model_boot_lcdc();
-        self.io[(STAT_REGISTER - IO_START) as usize] = self.model_boot_stat();
-        self.io[0x42] = 0x00; // SCY
-        self.io[0x43] = 0x00; // SCX
-        self.io[(LY_REGISTER - IO_START) as usize] = self.model_boot_ly();
-        self.io[0x45] = self.model_boot_lyc();
-        self.io[(DMA_REGISTER - IO_START) as usize] = 0xFF;
-        self.io[0x47] = 0xFC; // BGP
-        self.io[0x48] = self.model_boot_obp0();
-        self.io[0x49] = 0xFF; // OBP1
-        self.io[0x4A] = 0x00; // WY
-        self.io[0x4B] = 0x00; // WX
-        self.refresh_stat();
-    }
-
-    pub fn trace_entries(&self) -> Vec<TraceEntry> {
-        self.trace.iter().copied().collect()
-    }
-
-    pub fn clear_trace(&mut self) {
-        self.trace.clear();
-    }
-
-    pub fn serial_output(&self) -> &[u8] {
-        &self.serial_output
-    }
-
-    pub fn clear_serial_output(&mut self) {
-        self.serial_output.clear();
-    }
-
-    pub fn last_watchpoint(&self) -> Option<(&'static str, u16)> {
-        self.pending_watchpoint.map(|hit| {
-            let kind = match hit.kind {
-                WatchpointKind::Read => "read",
-                WatchpointKind::Write => "write",
-            };
-            (kind, hit.address)
-        })
-    }
-
-    pub fn debug_state(&self) -> DebugState {
-        DebugState {
-            cycle_counter: self.cycle_counter,
-            div_counter: self.div_counter,
-            ppu_cycle_counter: self.ppu_cycle_counter,
-            ime: self.ime,
-            ie: self.ie,
-            if_reg: self.io[(IF_REGISTER - IO_START) as usize],
-            lcdc: self.io[(LCDC_REGISTER - IO_START) as usize],
-            stat: self.io[(STAT_REGISTER - IO_START) as usize],
-            ly: self.io[(LY_REGISTER - IO_START) as usize],
-        }
-    }
-
-    pub fn model(&self) -> GbModel {
-        self.model
-    }
-
-    pub fn read_system_address(&mut self, address: u16) -> u8 {
-        self.read8(address)
-    }
-
-    pub fn write_system_address(&mut self, address: u16, value: u8) {
-        self.write8(address, value);
-    }
-
-    fn model_boot_registers(&self) -> Registers {
-        match self.model {
-            GbModel::Dmg0 => Registers {
-                a: 0x01,
-                f: 0x00,
-                b: 0xFF,
-                c: 0x13,
-                d: 0x00,
-                e: 0xC1,
-                h: 0x84,
-                l: 0x03,
-                sp: 0xFFFE,
-                pc: 0x0100,
-            },
-            GbModel::Dmg => Registers {
-                a: 0x01,
-                f: 0xB0,
-                b: 0x00,
-                c: 0x13,
-                d: 0x00,
-                e: 0xD8,
-                h: 0x01,
-                l: 0x4D,
-                sp: 0xFFFE,
-                pc: 0x0100,
-            },
-            GbModel::Mgb => Registers {
-                a: 0xFF,
-                f: 0xB0,
-                b: 0x00,
-                c: 0x13,
-                d: 0x00,
-                e: 0xD8,
-                h: 0x01,
-                l: 0x4D,
-                sp: 0xFFFE,
-                pc: 0x0100,
-            },
-            GbModel::Sgb => Registers {
-                a: 0x01,
-                f: 0x00,
-                b: 0x00,
-                c: 0x14,
-                d: 0x00,
-                e: 0x00,
-                h: 0xC0,
-                l: 0x60,
-                sp: 0xFFFE,
-                pc: 0x0100,
-            },
-            GbModel::Sgb2 => Registers {
-                a: 0xFF,
-                f: 0x00,
-                b: 0x00,
-                c: 0x14,
-                d: 0x00,
-                e: 0x00,
-                h: 0xC0,
-                l: 0x60,
-                sp: 0xFFFE,
-                pc: 0x0100,
-            },
-        }
-    }
-
-    fn model_boot_div_counter(&self) -> u16 {
-        match self.model {
-            GbModel::Dmg0 => 0x18D0,
-            GbModel::Dmg => 0xABD0,
-            GbModel::Mgb => 0xABD0,
-            GbModel::Sgb | GbModel::Sgb2 => 0xD8D0,
-        }
-    }
-
-    fn model_boot_p1(&self) -> u8 {
-        match self.model {
-            GbModel::Sgb | GbModel::Sgb2 => 0xFF,
-            _ => 0xCF,
-        }
-    }
-
-    fn model_boot_lcdc(&self) -> u8 {
-        match self.model {
-            GbModel::Dmg0 => 0x91,
-            GbModel::Dmg | GbModel::Mgb => 0x91,
-            GbModel::Sgb | GbModel::Sgb2 => 0x91,
-        }
-    }
-
-    fn model_boot_stat(&self) -> u8 {
-        match self.model {
-            GbModel::Dmg0 => 0x83,
-            GbModel::Dmg | GbModel::Mgb => 0x80,
-            GbModel::Sgb | GbModel::Sgb2 => 0x80,
-        }
-    }
-
-    fn model_boot_ly(&self) -> u8 {
-        match self.model {
-            GbModel::Dmg0 => 0x01,
-            _ => 0x00,
-        }
-    }
-
-    fn model_boot_lyc(&self) -> u8 {
-        match self.model {
-            GbModel::Dmg0 => 0x00,
-            GbModel::Dmg | GbModel::Mgb => 0x0A,
-            GbModel::Sgb | GbModel::Sgb2 => 0x00,
-        }
-    }
-
-    fn model_boot_obp0(&self) -> u8 {
-        match self.model {
-            GbModel::Sgb | GbModel::Sgb2 => 0x00,
-            _ => 0xFF,
-        }
-    }
-
-    fn model_boot_nr52(&self) -> u8 {
-        match self.model {
-            GbModel::Sgb | GbModel::Sgb2 => 0xF0,
-            _ => 0xF1,
-        }
-    }
-
-    fn set_exec_state(&mut self, state: ExecState) {
-        self.exec_state = state;
-    }
-
-    pub fn save_state(&self) -> Result<Vec<u8>, GbError> {
-        let state = SnapshotState {
-            rom: self.rom.clone(),
-            rom_bank: self.rom_bank,
-            model: self.model,
-            eram: self.eram.to_vec(),
-            vram: self.vram.to_vec(),
-            wram: self.wram.to_vec(),
-            oam: self.oam.to_vec(),
-            io: self.io.to_vec(),
-            hram: self.hram.to_vec(),
-            ie: self.ie,
-            registers: self.registers,
-            prefetched_pc: self.prefetched_pc,
-            prefetched_opcode: self.prefetched_opcode,
-            breakpoints: self
-                .breakpoints
-                .iter()
-                .copied()
-                .map(SnapshotBreakpoint::from)
-                .collect(),
-            ime: self.ime,
-            ime_enable_delay: 0,
-            exec_state: self.exec_state,
-            halted: matches!(self.exec_state, ExecState::Halt),
-            halt_bug: false,
-            instruction_counter: self.instruction_counter,
-            cycle_counter: self.cycle_counter,
-            div_counter: self.div_counter,
-            tima_reload_state: self.tima_reload_state,
-            ppu_cycle_counter: self.ppu_cycle_counter,
-            dma_source: self.dma_source,
-            dma_active: self.dma_active,
-            dma_requested_source: self.dma_requested_source,
-            dma_starting_source: self.dma_starting_source,
-            dma_next_byte: self.dma_next_byte,
-            pending_watchpoint: self.pending_watchpoint,
-            trace: self.trace.iter().copied().map(SnapshotTraceEntry::from).collect(),
-            serial_output: self.serial_output.clone(),
-        };
-
-        serde_json::to_vec(&state).map_err(|_| GbError::StackOverflow(0))
-    }
-
-    pub fn load_state(bytes: &[u8]) -> Result<Self, GbError> {
-        let state: SnapshotState =
-            serde_json::from_slice(bytes).map_err(|_| GbError::StackOverflow(0))?;
-        if state.rom.is_empty() {
-            return Err(GbError::EmptyRom);
-        }
-
-        let mut machine = Self::new_with_model(state.rom, state.model)?;
-        machine.rom_bank = state.rom_bank;
-        machine.eram.copy_from_slice(&state.eram[..0x2000]);
-        machine.vram.copy_from_slice(&state.vram[..0x2000]);
-        machine.wram.copy_from_slice(&state.wram[..0x2000]);
-        machine.oam.copy_from_slice(&state.oam[..0xA0]);
-        machine.io.copy_from_slice(&state.io[..0x80]);
-        machine.hram.copy_from_slice(&state.hram[..0x7F]);
-        machine.ie = state.ie;
-        machine.registers = state.registers;
-        machine.prefetched_pc = state.prefetched_pc;
-        machine.prefetched_opcode = state.prefetched_opcode;
-        machine.breakpoints = state.breakpoints.into_iter().map(Breakpoint::from).collect();
-        machine.ime = state.ime;
-        machine.exec_state = if state.halted { ExecState::Halt } else { state.exec_state };
-        machine.instruction_counter = state.instruction_counter;
-        machine.cycle_counter = state.cycle_counter;
-        machine.div_counter = state.div_counter;
-        machine.tima_reload_state = state.tima_reload_state;
-        machine.ppu_cycle_counter = state.ppu_cycle_counter;
-        machine.dma_source = state.dma_source;
-        machine.dma_active = state.dma_active;
-        machine.dma_requested_source = state.dma_requested_source;
-        machine.dma_starting_source = state.dma_starting_source;
-        machine.dma_next_byte = state.dma_next_byte;
-        machine.pending_watchpoint = state.pending_watchpoint;
-        machine.trace = state.trace.into_iter().map(TraceEntry::from).collect();
-        machine.serial_output = state.serial_output;
-        machine.refresh_stat();
-        Ok(machine)
-    }
-
-    pub fn disassemble_range(&self, start: u16, count: usize) -> Vec<DisassembledInstruction> {
-        let mut out = Vec::with_capacity(count);
-        let mut pc = start;
-        for _ in 0..count {
-            let inst = self.disassemble_one(pc);
-            pc = pc.wrapping_add(u16::from(inst.len.max(1)));
-            out.push(inst);
-        }
-        out
-    }
-
-    fn disassemble_one(&self, address: u16) -> DisassembledInstruction {
-        let opcode = self.peek8(address);
-        let b1 = self.peek8(address.wrapping_add(1));
-        let b2 = self.peek8(address.wrapping_add(2));
-        let word = u16::from_le_bytes([b1, b2]);
-        let (len, text) = match opcode {
-            0x00 => (1, "NOP".to_string()),
-            0x01 => (3, format!("LD BC,${word:04X}")),
-            0x03 => (1, "INC BC".to_string()),
-            0x04 => (1, "INC B".to_string()),
-            0x05 => (1, "DEC B".to_string()),
-            0x06 => (2, format!("LD B,${b1:02X}")),
-            0x0D => (1, "DEC C".to_string()),
-            0x0E => (2, format!("LD C,${b1:02X}")),
-            0x11 => (3, format!("LD DE,${word:04X}")),
-            0x13 => (1, "INC DE".to_string()),
-            0x18 => (2, format!("JR {:+}", b1 as i8)),
-            0x20 => (2, format!("JR NZ,{:+}", b1 as i8)),
-            0x21 => (3, format!("LD HL,${word:04X}")),
-            0x22 => (1, "LD (HL+),A".to_string()),
-            0x23 => (1, "INC HL".to_string()),
-            0x28 => (2, format!("JR Z,{:+}", b1 as i8)),
-            0x2A => (1, "LD A,(HL+)".to_string()),
-            0x31 => (3, format!("LD SP,${word:04X}")),
-            0x32 => (1, "LD (HL-),A".to_string()),
-            0x3A => (1, "LD A,(HL-)".to_string()),
-            0x3C => (1, "INC A".to_string()),
-            0x3D => (1, "DEC A".to_string()),
-            0x3E => (2, format!("LD A,${b1:02X}")),
-            0x76 => (1, "HALT".to_string()),
-            0x77 => (1, "LD (HL),A".to_string()),
-            0x78..=0x7F => (1, format!("LD A,{}", r8_name(opcode & 0x07))),
-            0xA8..=0xAF => (1, format!("XOR {}", r8_name(opcode & 0x07))),
-            0xB0..=0xB7 => (1, format!("OR {}", r8_name(opcode & 0x07))),
-            0xC1 => (1, "POP BC".to_string()),
-            0xC3 => (3, format!("JP ${word:04X}")),
-            0xC5 => (1, "PUSH BC".to_string()),
-            0xC9 => (1, "RET".to_string()),
-            0xCD => (3, format!("CALL ${word:04X}")),
-            0xD1 => (1, "POP DE".to_string()),
-            0xD5 => (1, "PUSH DE".to_string()),
-            0xE0 => (2, format!("LDH ($FF{b1:02X}),A")),
-            0xE1 => (1, "POP HL".to_string()),
-            0xE5 => (1, "PUSH HL".to_string()),
-            0xEA => (3, format!("LD (${word:04X}),A")),
-            0xF0 => (2, format!("LDH A,($FF{b1:02X})")),
-            0xF1 => (1, "POP AF".to_string()),
-            0xF3 => (1, "DI".to_string()),
-            0xF5 => (1, "PUSH AF".to_string()),
-            0xFB => (1, "EI".to_string()),
-            0xFE => (2, format!("CP ${b1:02X}")),
-            0xCB => (2, format!("CB {}", cb_name(b1))),
-            _ => (1, format!("DB ${opcode:02X}")),
-        };
-        let bytes = (0..len)
-            .map(|offset| self.peek8(address.wrapping_add(u16::from(offset))))
-            .collect();
-        DisassembledInstruction {
-            address,
-            bytes,
-            text,
-            len,
-        }
-    }
-
-    fn push_trace(&mut self, entry: TraceEntry) {
-        if self.trace.len() == TRACE_CAPACITY {
-            self.trace.pop_front();
-        }
-        self.trace.push_back(entry);
-    }
-
-    fn has_pc_breakpoint(&self, pc: u16) -> bool {
-        self.breakpoints
-            .iter()
-            .any(|bp| matches!(bp, Breakpoint::ProgramCounter(value) if *value == u32::from(pc)))
-    }
-
-    fn has_opcode_breakpoint(&self, opcode: u8) -> bool {
-        self.breakpoints
-            .iter()
-            .any(|bp| matches!(bp, Breakpoint::Opcode(value) if *value == opcode))
-    }
-
-    fn matching_watchpoint(&self, kind: WatchpointKind, address: u16) -> bool {
-        self.breakpoints.iter().any(|bp| match (bp, kind) {
-            (Breakpoint::MemoryRead(value), WatchpointKind::Read) => *value == u32::from(address),
-            (Breakpoint::MemoryWrite(value), WatchpointKind::Write) => *value == u32::from(address),
-            _ => false,
-        })
-    }
-
-    fn record_watchpoint(&mut self, kind: WatchpointKind, address: u16) {
-        if self.matching_watchpoint(kind, address) {
-            self.pending_watchpoint = Some(WatchpointHit { kind, address });
-        }
-    }
-
-    fn cpu_bus(address: u16) -> Bus {
-        match address {
-            0x0000..=ROM_BANK_N_END | 0xA000..=0xBFFF | WRAM_START..=WRAM_END | ECHO_START..=ECHO_END => Bus::External,
-            VRAM_START..=VRAM_END => Bus::ExternalVideo,
-            OAM_START..=OAM_END => Bus::InternalVideo,
-            _ => Bus::Internal,
-        }
-    }
-
-    fn dma_source_bus(&self) -> Option<Bus> {
-        if !self.dma_active() {
-            return None;
-        }
-        let high = (self.dma_source >> 8) as u8;
-        Some(match high {
-            0x80..=0x9F => Bus::ExternalVideo,
-            _ => Bus::External,
-        })
-    }
-
-    fn dma_blocks_cpu_access(&self, address: u16) -> bool {
-        let cpu_bus = Self::cpu_bus(address);
-        if cpu_bus == Bus::InternalVideo {
-            return self.dma_active();
-        }
-        matches!(self.dma_source_bus(), Some(source_bus) if source_bus == cpu_bus)
-    }
-
-    fn lcd_enabled(&self) -> bool {
-        self.io[(LCDC_REGISTER - IO_START) as usize] & 0x80 != 0
-    }
-
-    fn current_ly(&self) -> u8 {
-        self.io[(LY_REGISTER - IO_START) as usize]
-    }
-
-    fn ppu_mode(&self) -> u8 {
-        if !self.lcd_enabled() {
-            return 0;
-        }
-        if self.current_ly() >= 144 {
-            return 1;
-        }
-        if self.ppu_cycle_counter < 80 {
-            2
-        } else if self.ppu_cycle_counter < 252 {
-            3
-        } else {
-            0
-        }
-    }
-
-    fn refresh_stat(&mut self) {
-        let stat_index = (STAT_REGISTER - IO_START) as usize;
-        let lyc_index = (0xFF45 - IO_START) as usize;
-        let ly_equals_lyc = self.io[(LY_REGISTER - IO_START) as usize] == self.io[lyc_index];
-        let mut stat = self.io[stat_index] & 0xF8;
-        if ly_equals_lyc {
-            stat |= 0x04;
-        }
-        stat |= self.ppu_mode() & 0x03;
-        self.io[stat_index] = stat;
-    }
-
-    fn oam_bug_row(&self) -> Option<usize> {
-        if self.ppu_mode() == 2 {
-            Some(usize::from((self.ppu_cycle_counter / 4).min(19)))
-        } else {
-            None
-        }
-    }
-
-    fn oam_bug_applies(address: u16) -> bool {
-        (0xFE00..=0xFEFF).contains(&address)
-    }
-
-    fn oam_word(&self, row: usize, word: usize) -> u16 {
-        let base = row * 8 + word * 2;
-        u16::from_le_bytes([self.oam[base], self.oam[base + 1]])
-    }
-
-    fn set_oam_word(&mut self, row: usize, word: usize, value: u16) {
-        let base = row * 8 + word * 2;
-        let [lo, hi] = value.to_le_bytes();
-        self.oam[base] = lo;
-        self.oam[base + 1] = hi;
-    }
-
-    fn apply_oam_row_corruption(&mut self, row: usize, kind: OamCorruptionKind) {
-        if row == 0 || row >= 20 {
-            return;
-        }
-
-        match kind {
-            OamCorruptionKind::Write => {
-                let a = self.oam_word(row, 0);
-                let b = self.oam_word(row - 1, 0);
-                let c = self.oam_word(row - 1, 2);
-                self.set_oam_word(row, 0, ((a ^ c) & (b ^ c)) ^ c);
-                for word in 1..4 {
-                    self.set_oam_word(row, word, self.oam_word(row - 1, word));
-                }
-            }
-            OamCorruptionKind::Read => {
-                let a = self.oam_word(row, 0);
-                let b = self.oam_word(row - 1, 0);
-                let c = self.oam_word(row - 1, 2);
-                self.set_oam_word(row, 0, b | (a & c));
-                for word in 1..4 {
-                    self.set_oam_word(row, word, self.oam_word(row - 1, word));
-                }
-            }
-            OamCorruptionKind::ReadWrite => {
-                if row >= 4 && row < 19 {
-                    let a = self.oam_word(row - 2, 0);
-                    let b = self.oam_word(row - 1, 0);
-                    let c = self.oam_word(row, 0);
-                    let d = self.oam_word(row - 1, 2);
-                    let corrupted_prev = (b & (a | c | d)) | (a & c & d);
-                    self.set_oam_word(row - 1, 0, corrupted_prev);
-                    for word in 1..4 {
-                        let prev = self.oam_word(row - 1, word);
-                        self.set_oam_word(row, word, prev);
-                        self.set_oam_word(row - 2, word, prev);
-                    }
-                    self.set_oam_word(row, 0, corrupted_prev);
-                    self.set_oam_word(row - 2, 0, corrupted_prev);
-                }
-                self.apply_oam_row_corruption(row, OamCorruptionKind::Read);
-            }
-        }
-    }
-
-    fn maybe_trigger_oam_bug(&mut self, address: u16, kind: OamCorruptionKind) {
-        if !Self::oam_bug_applies(address) {
-            return;
-        }
-        if let Some(row) = self.oam_bug_row() {
-            self.apply_oam_row_corruption(row, kind);
-        }
-    }
-
-    fn read8_with_kind(&mut self, address: u16, _kind: OamCorruptionKind) -> u8 {
-        self.record_watchpoint(WatchpointKind::Read, address);
-        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
-            return 0xFF;
-        }
-        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
-            return 0xFF;
-        }
-        if self.dma_blocks_cpu_access(address) {
-            return 0xFF;
-        }
-        self.peek8(address)
-    }
-
-    fn read8(&mut self, address: u16) -> u8 {
-        self.read8_with_kind(address, OamCorruptionKind::Read)
-    }
-
-    fn peek8(&self, address: u16) -> u8 {
-        if self.dma_blocks_cpu_access(address) {
-            return 0xFF;
-        }
-        match address {
-            0x0000..=ROM_BANK_0_END => {
-                self.rom.get(address as usize).copied().unwrap_or(0xFF)
-            }
-            0x4000..=ROM_BANK_N_END => {
-                let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(address - 0x4000);
-                self.rom.get(offset as usize).copied().unwrap_or(0xFF)
-            }
-            0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize],
-            VRAM_START..=VRAM_END => self.vram[(address - VRAM_START) as usize],
-            WRAM_START..=WRAM_END => self.wram[(address - WRAM_START) as usize],
-            ECHO_START..=ECHO_END => self.wram[(address - ECHO_START) as usize],
-            OAM_START..=OAM_END => self.oam[(address - OAM_START) as usize],
-            IO_START..=IO_END => self.io[(address - IO_START) as usize],
-            HRAM_START..=HRAM_END => self.hram[(address - HRAM_START) as usize],
-            IE_REGISTER => self.ie,
-            _ => 0xFF,
-        }
-    }
-
-    fn read8_without_oam_bug(&mut self, address: u16) -> u8 {
-        self.record_watchpoint(WatchpointKind::Read, address);
-        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
-            return 0xFF;
-        }
-        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
-            return 0xFF;
-        }
-        self.peek8(address)
-    }
-
-    fn write8(&mut self, address: u16, value: u8) {
-        self.record_watchpoint(WatchpointKind::Write, address);
-        if Self::oam_bug_applies(address) && self.ppu_mode() == 2 {
-            self.maybe_trigger_oam_bug(address, OamCorruptionKind::Write);
-            return;
-        }
-        if self.ppu_mode() == 3 && matches!(address, VRAM_START..=VRAM_END | OAM_START..=OAM_END) {
-            return;
-        }
-        if self.dma_blocks_cpu_access(address) {
-            return;
-        }
-        match address {
-            0x2000..=0x2FFF => {
-                self.rom_bank = (self.rom_bank & 0x100) | u16::from(value);
-            }
-            0x3000..=0x3FFF => {
-                self.rom_bank = (self.rom_bank & 0x0FF) | (u16::from(value & 0x01) << 8);
-            }
-            0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize] = value,
-            VRAM_START..=VRAM_END => self.vram[(address - VRAM_START) as usize] = value,
-            WRAM_START..=WRAM_END => self.wram[(address - WRAM_START) as usize] = value,
-            ECHO_START..=ECHO_END => self.wram[(address - ECHO_START) as usize] = value,
-            OAM_START..=OAM_END => {
-                if !self.dma_active() {
-                    self.oam[(address - OAM_START) as usize] = value;
-                }
-            }
-            IO_START..=IO_END => self.write_io(address, value),
-            HRAM_START..=HRAM_END => self.hram[(address - HRAM_START) as usize] = value,
-            IE_REGISTER => self.ie = value,
-            _ => {}
-        }
-    }
-
-    fn dma_active(&self) -> bool {
-        self.dma_active
-    }
-
-    fn step_dma_mcycle(&mut self) {
-        if self.dma_active {
-            if self.dma_next_byte < 0xA0 {
-                self.oam[self.dma_next_byte as usize] =
-                    self.dma_source_byte(self.dma_source.wrapping_add(self.dma_next_byte));
-                self.dma_next_byte += 1;
-            }
-            if self.dma_next_byte >= 0xA0 {
-                self.dma_active = false;
-            }
-        }
-
-        if let Some(source) = self.dma_starting_source.take() {
-            self.dma_source = source;
-            self.dma_active = true;
-            self.dma_next_byte = 0;
-        }
-
-        if let Some(source) = self.dma_requested_source.take() {
-            self.dma_starting_source = Some(source);
-        }
-    }
-
-    fn dma_source_byte(&self, address: u16) -> u8 {
-        match address {
-            0x0000..=ROM_BANK_0_END => {
-                self.rom.get(address as usize).copied().unwrap_or(0xFF)
-            }
-            0x4000..=ROM_BANK_N_END => {
-                let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(address - 0x4000);
-                self.rom.get(offset as usize).copied().unwrap_or(0xFF)
-            }
-            0x8000..=0x9FFF => self.vram[(address - 0x8000) as usize],
-            0xA000..=0xBFFF => self.eram[(address - 0xA000) as usize],
-            0xC000..=0xDFFF => self.wram[(address - 0xC000) as usize],
-            0xE000..=0xFDFF => self.wram[(address - 0xE000) as usize],
-            // OAM DMA does not use the CPU's usual FE/FF decoding; these ranges source from the
-            // external bus instead, which makes them mirror the WRAM echo area on DMG.
-            0xFE00..=0xFFFF => {
-                let external_address = address.wrapping_sub(0x2000);
-                self.dma_source_byte(external_address)
-            }
-        }
-    }
-
-    fn write_io(&mut self, address: u16, value: u8) {
-        match address {
-            LCDC_REGISTER => {
-                let was_enabled = self.lcd_enabled();
-                self.io[(address - IO_START) as usize] = value;
-                let now_enabled = value & 0x80 != 0;
-                if !was_enabled && now_enabled {
-                    self.ppu_cycle_counter = 4;
-                    self.io[(LY_REGISTER - IO_START) as usize] = 0;
-                } else if was_enabled && !now_enabled {
-                    self.ppu_cycle_counter = 0;
-                    self.io[(LY_REGISTER - IO_START) as usize] = 0;
-                }
-                self.refresh_stat();
-            }
-            TIMER_DIV => {
-                let old_signal = self.timer_signal();
-                self.div_counter = 0;
-                self.io[(address - IO_START) as usize] = 0;
-                if old_signal && !self.timer_signal() {
-                    self.increment_tima();
-                }
-            }
-            TIMER_TIMA => {
-                match self.tima_reload_state {
-                    Some(TimaReloadState::OverflowDelay(_)) => {
-                        self.tima_reload_state = None;
-                    }
-                    Some(TimaReloadState::ReloadWindow(_)) => {
-                        return;
-                    }
-                    None => {}
-                }
-                self.io[(address - IO_START) as usize] = value;
-            }
-            TIMER_TMA => {
-                self.io[(address - IO_START) as usize] = value;
-                if matches!(self.tima_reload_state, Some(TimaReloadState::ReloadWindow(_))) {
-                    self.io[(TIMER_TIMA - IO_START) as usize] = value;
-                }
-            }
-            SERIAL_SB => {
-                self.io[(address - IO_START) as usize] = value;
-            }
-            DMA_REGISTER => {
-                self.io[(address - IO_START) as usize] = value;
-                let source = u16::from(value) << 8;
-                self.dma_requested_source = Some(source);
-            }
-            TIMER_TAC => {
-                let old_signal = self.timer_signal();
-                self.io[(address - IO_START) as usize] = value;
-                if old_signal && !self.timer_signal() {
-                    self.increment_tima();
-                }
-            }
-            SERIAL_SC => {
-                self.io[(address - IO_START) as usize] = value;
-                if value == 0x81 {
-                    let byte = self.io[(SERIAL_SB - IO_START) as usize];
-                    self.serial_output.push(byte);
-                    self.io[(SERIAL_SC - IO_START) as usize] = 0x01;
-                    self.request_interrupt(0x08);
-                }
-            }
-            IF_REGISTER => {
-                self.io[(address - IO_START) as usize] = value | 0xE0;
-            }
-            _ => {
-                self.io[(address - IO_START) as usize] = value;
-            }
-        }
-    }
-
-    fn fetch8(&mut self) -> u8 {
-        let pc = self.registers.pc;
-        let value = if Self::oam_bug_applies(pc) && self.ppu_mode() == 2 {
-            self.read8_with_kind(pc, OamCorruptionKind::ReadWrite)
-        } else {
-            self.read8(pc)
-        };
-        self.registers.pc = self.registers.pc.wrapping_add(1);
-        value
-    }
-
     fn logical_pc(&self) -> u16 {
         self.prefetched_pc.unwrap_or(self.registers.pc)
     }
@@ -1405,11 +677,18 @@ impl GbMachine {
         registers.as_snapshot()
     }
 
-    fn prefetch_opcode_cycle(&mut self, address: u16, advance_pc: bool, allow_interrupt_dispatch: bool) {
-        self.tick_mcycle();
+    fn prefetch_opcode_cycle(
+        &mut self,
+        address: u16,
+        advance_pc: bool,
+        allow_interrupt_dispatch: bool,
+    ) {
+        self.tick_timers(4);
         self.prefetched_pc = Some(address);
         self.prefetched_opcode = Some(self.read8(address));
-        if allow_interrupt_dispatch && self.ime && self.pending_interrupts() != 0 {
+        let sampled_interrupts = self.pending_interrupts();
+        self.flush_pending_t34_interrupts();
+        if allow_interrupt_dispatch && self.ime && sampled_interrupts != 0 {
             self.registers.pc = address;
             self.set_exec_state(ExecState::InterruptDispatch);
         } else {
@@ -1435,22 +714,25 @@ impl GbMachine {
     }
 
     fn consume_opcode(&mut self) -> (u16, u8) {
-        if let (Some(pc), Some(opcode)) = (self.prefetched_pc.take(), self.prefetched_opcode.take()) {
+        if let (Some(pc), Some(opcode)) = (self.prefetched_pc.take(), self.prefetched_opcode.take())
+        {
             (pc, opcode)
         } else {
             let opcode_pc = self.registers.pc;
-            let opcode = self.fetch8();
+            let opcode = self.fetch8_cycle();
             (opcode_pc, opcode)
         }
     }
 
     fn tick_mcycle(&mut self) {
         self.tick_timers(4);
+        self.flush_pending_t34_interrupts();
     }
 
     fn fetch8_cycle(&mut self) -> u8 {
-        self.tick_mcycle();
+        self.tick_timers(4);
         let value = self.read8(self.registers.pc);
+        self.flush_pending_t34_interrupts();
         self.registers.pc = self.registers.pc.wrapping_add(1);
         value
     }
@@ -1466,13 +748,24 @@ impl GbMachine {
     }
 
     fn read_cycle(&mut self, address: u16) -> u8 {
-        self.tick_mcycle();
-        self.read8(address)
+        self.tick_timers(4);
+        let value = self.read8(address);
+        self.flush_pending_t34_interrupts();
+        value
     }
 
     fn write_cycle(&mut self, address: u16, value: u8) {
-        self.tick_mcycle();
+        self.tick_timers(4);
         self.write8(address, value);
+        self.flush_pending_t34_interrupts();
+    }
+
+    fn write_cycle_intr(&mut self, address: u16, value: u8) -> u8 {
+        self.tick_timers(4);
+        self.write8(address, value);
+        let sampled_interrupts = self.pending_interrupts();
+        self.flush_pending_t34_interrupts();
+        sampled_interrupts
     }
 
     fn read_r8_data(&mut self, index: u8) -> u8 {
@@ -1776,7 +1069,10 @@ impl GbMachine {
         self.set_flag(0x80, result == 0);
         self.set_flag(0x40, false);
         self.set_flag(0x20, ((a & 0x0F) + (value & 0x0F) + carry) > 0x0F);
-        self.set_flag(0x10, (u16::from(a) + u16::from(value) + u16::from(carry)) > 0xFF);
+        self.set_flag(
+            0x10,
+            (u16::from(a) + u16::from(value) + u16::from(carry)) > 0xFF,
+        );
     }
 
     fn flag_z(&self) -> bool {
@@ -2342,7 +1638,7 @@ impl GbMachine {
         Ok(())
     }
 
-    fn execute_opcode_00_3f(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+    fn execute_opcode_00_3f(&mut self, opcode: u8, _opcode_pc: u16) -> Result<(), GbError> {
         let reg16 = Self::decode_reg16_pair((opcode >> 4) & 0x03);
         match opcode {
             0x00 => self.prefetch_next_cycle(self.registers.pc),
@@ -2365,6 +1661,10 @@ impl GbMachine {
             0x0D => self.exec_dec8(Out8::Reg(Reg8Id::C)),
             0x0E => self.exec_load8(Out8::Reg(Reg8Id::C), In8::Imm8),
             0x0F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
+            0x10 => {
+                let _ = self.fetch8_timed_late();
+                self.set_exec_state(ExecState::Stop);
+            }
             0x11 => self.exec_load16_immediate(reg16),
             0x12 => self.exec_load8(Out8::Addr(AddrMode8::De), In8::Reg(Reg8Id::A)),
             0x13 => self.exec_inc16(reg16),
@@ -2416,17 +1716,12 @@ impl GbMachine {
             0x3D => self.exec_dec8(Out8::Reg(Reg8Id::A)),
             0x3E => self.exec_load8(Out8::Reg(Reg8Id::A), In8::Imm8),
             0x3F => self.exec_accumulator_op(Self::decode_accumulator_op(opcode).unwrap()),
-            _ => {
-                return Err(GbError::UnsupportedOpcode {
-                    opcode,
-                    pc: opcode_pc,
-                });
-            }
+            _ => unreachable!("unhandled opcode in 00-3F dispatcher: 0x{opcode:02X}"),
         }
         Ok(())
     }
 
-    fn execute_opcode_40_bf(&mut self, opcode: u8, opcode_pc: u16) -> Result<(), GbError> {
+    fn execute_opcode_40_bf(&mut self, opcode: u8, _opcode_pc: u16) -> Result<(), GbError> {
         match opcode {
             0x40..=0x7F if opcode != 0x76 => {
                 let dst = Self::decode_r8_out((opcode >> 3) & 0x07);
@@ -2445,13 +1740,11 @@ impl GbMachine {
                     self.tick_mcycle();
                 }
             }
-            0x80..=0xBF => self.exec_decoded_alu(Self::decode_r8_in(opcode & 0x07), Self::decode_alu_op(opcode)),
-            _ => {
-                return Err(GbError::UnsupportedOpcode {
-                    opcode,
-                    pc: opcode_pc,
-                });
-            }
+            0x80..=0xBF => self.exec_decoded_alu(
+                Self::decode_r8_in(opcode & 0x07),
+                Self::decode_alu_op(opcode),
+            ),
+            _ => unreachable!("unhandled opcode in 40-BF dispatcher: 0x{opcode:02X}"),
         }
         Ok(())
     }
@@ -2479,6 +1772,12 @@ impl GbMachine {
             0xD0 => self.exec_ret_condition_prefetch(condition),
             0xD1 => self.pop_stack_reg16_prefetch(stack_reg),
             0xD2 => self.exec_jp_condition_immediate(condition),
+            0xD3 => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
             0xD4 => self.exec_call_condition_immediate(condition)?,
             0xD5 => self.push_stack_reg16_prefetch(stack_reg)?,
             0xD6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
@@ -2486,7 +1785,19 @@ impl GbMachine {
             0xD8 => self.exec_ret_condition_prefetch(condition),
             0xD9 => self.exec_reti(),
             0xDA => self.exec_jp_condition_immediate(condition),
+            0xDB => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
             0xDC => self.exec_call_condition_immediate(condition)?,
+            0xDD => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
             0xDE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
             0xDF => self.rst_to(Self::decode_rst_vector(opcode))?,
             0xE0 => {
@@ -2495,6 +1806,18 @@ impl GbMachine {
             0xE1 => self.pop_stack_reg16_prefetch(stack_reg),
             0xE2 => {
                 self.exec_load8(Out8::Addr(AddrMode8::ZeroPageC), In8::Reg(Reg8Id::A));
+            }
+            0xE3 => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+            0xE4 => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
             }
             0xE5 => self.push_stack_reg16_prefetch(stack_reg)?,
             0xE6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
@@ -2506,6 +1829,24 @@ impl GbMachine {
             0xE9 => self.prefetch_next_cycle(self.registers.hl()),
             0xEA => {
                 self.exec_load8(Out8::Addr(AddrMode8::Direct), In8::Reg(Reg8Id::A));
+            }
+            0xEB => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+            0xEC => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+            0xED => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
             }
             0xEE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
             0xEF => self.rst_to(Self::decode_rst_vector(opcode))?,
@@ -2520,6 +1861,12 @@ impl GbMachine {
                 self.ime = false;
                 self.prefetch_no_interrupt_cycle(self.registers.pc);
             }
+            0xF4 => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
             0xF5 => self.push_stack_reg16_prefetch(stack_reg)?,
             0xF6 => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
             0xF7 => self.rst_to(Self::decode_rst_vector(opcode))?,
@@ -2532,17 +1879,24 @@ impl GbMachine {
                 self.exec_load8(Out8::Reg(Reg8Id::A), In8::Addr(AddrMode8::Direct));
             }
             0xFB => {
-                self.prefetch_no_interrupt_cycle(self.registers.pc);
+                self.prefetch_next_cycle(self.registers.pc);
                 self.ime = true;
             }
-            0xFE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
-            0xFF => self.rst_to(Self::decode_rst_vector(opcode))?,
-            _ => {
-                return Err(GbError::UnsupportedOpcode {
+            0xFC => {
+                return Err(GbError::IllegalOpcode {
                     opcode,
                     pc: opcode_pc,
                 });
             }
+            0xFD => {
+                return Err(GbError::IllegalOpcode {
+                    opcode,
+                    pc: opcode_pc,
+                });
+            }
+            0xFE => self.exec_decoded_alu(In8::Imm8, Self::decode_alu_op(opcode)),
+            0xFF => self.rst_to(Self::decode_rst_vector(opcode))?,
+            _ => unreachable!("unhandled opcode in C0-FF dispatcher: 0x{opcode:02X}"),
         }
         Ok(())
     }
@@ -2568,12 +1922,14 @@ impl GbMachine {
     }
 
     fn pop16(&mut self) -> u16 {
-        self.tick_mcycle();
+        self.tick_timers(4);
         let lo = u16::from(self.read8_without_oam_bug(self.registers.sp));
+        self.flush_pending_t34_interrupts();
         self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.registers.sp = self.registers.sp.wrapping_add(1);
-        self.tick_mcycle();
+        self.tick_timers(4);
         let hi = u16::from(self.read8_without_oam_bug(self.registers.sp));
+        self.flush_pending_t34_interrupts();
         self.maybe_trigger_oam_bug(self.registers.sp, OamCorruptionKind::Write);
         self.registers.sp = self.registers.sp.wrapping_add(1);
         lo | (hi << 8)
@@ -2584,12 +1940,24 @@ impl GbMachine {
         self.io[(IF_REGISTER - IO_START) as usize] = value;
     }
 
+    fn request_interrupt_t34(&mut self, mask: u8) {
+        self.pending_t34_interrupts |= mask;
+    }
+
+    fn flush_pending_t34_interrupts(&mut self) {
+        if self.pending_t34_interrupts != 0 {
+            let mask = self.pending_t34_interrupts;
+            self.pending_t34_interrupts = 0;
+            self.request_interrupt(mask);
+        }
+    }
+
     fn timer_bit_mask(&self) -> u16 {
         match self.io[(TIMER_TAC - IO_START) as usize] & 0x03 {
-            0 => 1 << 9,
-            1 => 1 << 3,
-            2 => 1 << 5,
-            _ => 1 << 7,
+            0 => 1 << 7,
+            1 => 1 << 1,
+            2 => 1 << 3,
+            _ => 1 << 5,
         }
     }
 
@@ -2604,19 +1972,11 @@ impl GbMachine {
         self.io[tima_index] = next;
         if overflow {
             self.io[tima_index] = 0;
-            self.tima_reload_state = Some(TimaReloadState::OverflowDelay(4));
+            self.tima_reload_state = Some(TimaReloadState::OverflowDelay(1));
         }
     }
 
     fn step_timer_cycle(&mut self) {
-        let old_signal = self.timer_signal();
-        self.div_counter = self.div_counter.wrapping_add(1);
-        self.io[(TIMER_DIV - IO_START) as usize] = (self.div_counter >> 8) as u8;
-        let new_signal = self.timer_signal();
-        if old_signal && !new_signal {
-            self.increment_tima();
-        }
-
         if let Some(state) = self.tima_reload_state {
             match state {
                 TimaReloadState::OverflowDelay(remaining) => {
@@ -2624,9 +1984,10 @@ impl GbMachine {
                         let tma = self.io[(TIMER_TMA - IO_START) as usize];
                         self.io[(TIMER_TIMA - IO_START) as usize] = tma;
                         self.request_interrupt(0x04);
-                        self.tima_reload_state = Some(TimaReloadState::ReloadWindow(4));
+                        self.tima_reload_state = Some(TimaReloadState::ReloadWindow(1));
                     } else {
-                        self.tima_reload_state = Some(TimaReloadState::OverflowDelay(remaining - 1));
+                        self.tima_reload_state =
+                            Some(TimaReloadState::OverflowDelay(remaining - 1));
                     }
                 }
                 TimaReloadState::ReloadWindow(remaining) => {
@@ -2638,31 +1999,115 @@ impl GbMachine {
                 }
             }
         }
+
+        let old_signal = self.timer_signal();
+        self.div_counter = self.div_counter.wrapping_add(1);
+        self.io[(TIMER_DIV - IO_START) as usize] = (self.div_counter >> 6) as u8;
+        let new_signal = self.timer_signal();
+        if old_signal && !new_signal {
+            self.increment_tima();
+        }
+    }
+
+    fn switch_ppu_mode(&mut self, mode: PpuMode) {
+        self.ppu_mode = mode;
+        self.ppu_mode_cycles_remaining = self.ppu_mode_duration(mode);
+
+        let stat = self.io[(STAT_REGISTER - IO_START) as usize];
+        match mode {
+            PpuMode::AccessOam => {
+                if stat & 0x20 != 0 {
+                    self.request_interrupt_t34(0x02);
+                }
+            }
+            PpuMode::VBlank => {
+                self.request_interrupt_t34(0x01);
+                if stat & 0x10 != 0 {
+                    self.request_interrupt_t34(0x02);
+                }
+                if stat & 0x20 != 0 {
+                    self.request_interrupt_t34(0x02);
+                }
+            }
+            PpuMode::HBlank | PpuMode::AccessVram => {}
+        }
+    }
+
+    fn update_lyc_compare_interrupt(&mut self, old_match: bool) {
+        let ly = self.io[(LY_REGISTER - IO_START) as usize];
+        let lyc = self.io[(0xFF45 - IO_START) as usize];
+        let new_match = ly == lyc;
+        self.set_stat_lyc_flag(new_match);
+        if new_match && !old_match && (self.io[(STAT_REGISTER - IO_START) as usize] & 0x40 != 0) {
+            self.request_interrupt_t34(0x02);
+        }
     }
 
     fn step_ppu_cycle(&mut self) {
         let lcdc = self.io[(LCDC_REGISTER - IO_START) as usize];
         if lcdc & 0x80 == 0 {
-            self.ppu_cycle_counter = 0;
-            self.io[(LY_REGISTER - IO_START) as usize] = 0;
+            return;
+        }
+
+        let old_match =
+            self.io[(LY_REGISTER - IO_START) as usize] == self.io[(0xFF45 - IO_START) as usize];
+        self.ppu_cycle_counter = (self.ppu_cycle_counter + 4) % 456;
+        self.ppu_mode_cycles_remaining = self.ppu_mode_cycles_remaining.saturating_sub(1);
+
+        if self.ppu_mode == PpuMode::AccessVram
+            && self.ppu_mode_cycles_remaining == 1
+            && (self.io[(STAT_REGISTER - IO_START) as usize] & 0x08 != 0)
+        {
+            self.request_interrupt_t34(0x02);
+        }
+
+        if self.ppu_mode_cycles_remaining > 0 {
             self.refresh_stat();
             return;
         }
 
-        self.ppu_cycle_counter = self.ppu_cycle_counter.wrapping_add(1);
-        self.refresh_stat();
-        if self.ppu_cycle_counter < 456 {
-            return;
-        }
-
-        self.ppu_cycle_counter = 0;
         let ly_index = (LY_REGISTER - IO_START) as usize;
-        let next_ly = self.io[ly_index].wrapping_add(1);
-        self.io[ly_index] = if next_ly > 153 { 0 } else { next_ly };
-        if self.io[ly_index] == 144 {
-            self.request_interrupt(0x01);
+        match self.ppu_mode {
+            PpuMode::AccessOam => self.switch_ppu_mode(PpuMode::AccessVram),
+            PpuMode::AccessVram => self.switch_ppu_mode(PpuMode::HBlank),
+            PpuMode::HBlank => {
+                let next_ly = self.io[ly_index].wrapping_add(1);
+                self.io[ly_index] = next_ly;
+                if next_ly < 144 {
+                    self.switch_ppu_mode(PpuMode::AccessOam);
+                } else {
+                    self.switch_ppu_mode(PpuMode::VBlank);
+                }
+                self.update_lyc_compare_interrupt(old_match);
+            }
+            PpuMode::VBlank => {
+                let next_ly = self.io[ly_index].wrapping_add(1);
+                if next_ly > 153 {
+                    self.io[ly_index] = 0;
+                    self.switch_ppu_mode(PpuMode::AccessOam);
+                } else {
+                    self.io[ly_index] = next_ly;
+                    self.ppu_mode_cycles_remaining = PPU_VBLANK_LINE_CYCLES;
+                }
+                self.update_lyc_compare_interrupt(old_match);
+            }
         }
         self.refresh_stat();
+    }
+
+    fn ppu_mode_duration(&self, mode: PpuMode) -> u16 {
+        let scroll_adjust = match self.io[0x43] % 8 {
+            5..=7 => 2,
+            1..=4 => 1,
+            _ => 0,
+        };
+
+        match mode {
+            PpuMode::AccessOam => PPU_ACCESS_OAM_CYCLES,
+            PpuMode::AccessVram => PPU_ACCESS_VRAM_CYCLES + scroll_adjust,
+            PpuMode::HBlank => PPU_HBLANK_CYCLES - scroll_adjust,
+            PpuMode::VBlank => PPU_VBLANK_LINE_CYCLES,
+        }
     }
 
     fn pending_interrupts(&self) -> u8 {
@@ -2678,7 +2123,7 @@ impl GbMachine {
 
     fn execute_interrupt_dispatch(&mut self) -> Result<bool, GbError> {
         let pending = self.pending_interrupts();
-        let Some(_) = Self::highest_priority_interrupt(pending) else {
+        let Some((selected_mask, vector)) = Self::highest_priority_interrupt(pending) else {
             self.set_exec_state(ExecState::Running);
             return Ok(false);
         };
@@ -2694,32 +2139,31 @@ impl GbMachine {
         self.tick_mcycle();
         self.registers.sp = self.registers.sp.wrapping_sub(1);
         self.write_cycle(self.registers.sp, hi);
-
-        let pending_after_hi = self.pending_interrupts();
-        let Some((selected_mask, vector)) = Self::highest_priority_interrupt(pending_after_hi) else {
-            self.registers.pc = 0x0000;
-            self.set_exec_state(ExecState::Running);
-            return Ok(true);
-        };
-
         self.registers.sp = self.registers.sp.wrapping_sub(1);
-        self.write_cycle(self.registers.sp, lo);
+        let sampled_interrupts = self.write_cycle_intr(self.registers.sp, lo);
 
         let index = (IF_REGISTER - IO_START) as usize;
-        self.io[index] = (self.io[index] & !selected_mask) | 0xE0;
+        let ack_mask = Self::highest_priority_interrupt(sampled_interrupts)
+            .map(|(mask, _)| mask)
+            .unwrap_or(selected_mask);
+        self.io[index] = (self.io[index] & !ack_mask) | 0xE0;
         self.registers.pc = vector;
-        self.prefetch_next_cycle(self.registers.pc);
+        let opcode_pc = self.registers.pc;
+        let opcode = self.fetch8_cycle();
+        self.prefetched_pc = Some(opcode_pc);
+        self.prefetched_opcode = Some(opcode);
         self.set_exec_state(ExecState::Running);
         Ok(true)
     }
 
     fn tick_timers(&mut self, cycles: u16) {
+        self.cartridge.tick(cycles);
         for _ in 0..cycles {
             self.cycle_counter += 1;
-            self.step_timer_cycle();
-            self.step_ppu_cycle();
             if self.cycle_counter % 4 == 0 {
                 self.step_dma_mcycle();
+                self.step_ppu_cycle();
+                self.step_timer_cycle();
             }
         }
     }
@@ -2738,6 +2182,24 @@ impl GbMachine {
                 }
                 ExecState::Halt => {
                     if self.pending_interrupts() == 0 {
+                        self.tick_mcycle();
+                        return Ok(RunResult {
+                            stop_reason: StopReason::Halted,
+                        });
+                    }
+
+                    self.set_exec_state(ExecState::Running);
+                    self.prefetch_next_cycle(self.registers.pc);
+                    if matches!(self.exec_state, ExecState::InterruptDispatch) {
+                        continue;
+                    }
+
+                    return Ok(RunResult {
+                        stop_reason: StopReason::StepComplete,
+                    });
+                }
+                ExecState::Stop => {
+                    if self.pending_interrupts() == 0 && self.current_joypad_bits() == 0x0F {
                         self.tick_mcycle();
                         return Ok(RunResult {
                             stop_reason: StopReason::Halted,
@@ -2802,352 +2264,12 @@ impl GbMachine {
         let end = address.checked_add(u16::try_from(len).ok()?.saturating_sub(1))?;
         let mut bytes = Vec::with_capacity(len);
         for current in address..=end {
-            let value = match current {
-                0x0000..=ROM_BANK_0_END => {
-                    self.rom.get(current as usize).copied().unwrap_or(0xFF)
-                }
-                0x4000..=ROM_BANK_N_END => {
-                    let offset = u32::from(self.rom_bank) * 0x4000 + u32::from(current - 0x4000);
-                    self.rom.get(offset as usize).copied().unwrap_or(0xFF)
-                }
-                0xA000..=0xBFFF => self.eram[(current - 0xA000) as usize],
-                VRAM_START..=VRAM_END => self.vram[(current - VRAM_START) as usize],
-                WRAM_START..=WRAM_END => self.wram[(current - WRAM_START) as usize],
-                ECHO_START..=ECHO_END => self.wram[(current - ECHO_START) as usize],
-                OAM_START..=OAM_END => self.oam[(current - OAM_START) as usize],
-                IO_START..=IO_END => self.io[(current - IO_START) as usize],
-                HRAM_START..=HRAM_END => self.hram[(current - HRAM_START) as usize],
-                IE_REGISTER => self.ie,
-                _ => 0xFF,
-            };
-            bytes.push(value);
+            bytes.push(self.peek8(current));
         }
         Some(bytes)
     }
 }
 
-impl Machine for GbMachine {
-    type Error = GbError;
-
-    fn control(&mut self) -> &mut dyn MachineControl<Error = Self::Error> {
-        self
-    }
-
-    fn snapshot(&self) -> MachineSnapshot {
-        MachineSnapshot {
-            registers: self.snapshot_registers(),
-            halted: matches!(self.exec_state, ExecState::Halt),
-            instruction_counter: self.instruction_counter,
-        }
-    }
-
-    fn inspect_memory(&self, region: MemoryRegion, address: u32, len: usize) -> Option<Vec<u8>> {
-        let start = usize::try_from(address).ok()?;
-        match region {
-            MemoryRegion::Rom => self.rom.get(start..start.checked_add(len)?).map(|s| s.to_vec()),
-            MemoryRegion::Ram => self
-                .wram
-                .get(start..start.checked_add(len)?)
-                .map(|s| s.to_vec())
-                .or_else(|| self.eram.get(start..start.checked_add(len)?).map(|s| s.to_vec())),
-            MemoryRegion::Vram => self.vram.get(start..start.checked_add(len)?).map(|s| s.to_vec()),
-            MemoryRegion::Oam => self.oam.get(start..start.checked_add(len)?).map(|s| s.to_vec()),
-            MemoryRegion::AddressSpace(AddressSpace::System) => {
-                self.system_memory_slice(u16::try_from(address).ok()?, len)
-            }
-        }
-    }
-
-    fn render_frame(&self, _target: RenderTarget) -> Result<FrameBuffer, Self::Error> {
-        let mut frame = FrameBuffer::new_rgba(FRAME_WIDTH, FRAME_HEIGHT);
-
-        for y in 0..FRAME_HEIGHT as usize {
-            for x in 0..FRAME_WIDTH as usize {
-                let tile_x = x / 8;
-                let tile_y = y / 8;
-                let tile_index = (tile_y * 20 + tile_x) % self.vram.len();
-                let tile_value = self.vram[tile_index];
-                let pixel_value = tile_value
-                    .wrapping_add(self.registers.a)
-                    .wrapping_add((x as u8) ^ (y as u8));
-                let shade = pixel_value & 0b11;
-                let intensity = match shade {
-                    0 => 0xE0,
-                    1 => 0xA8,
-                    2 => 0x60,
-                    _ => 0x18,
-                };
-
-                let offset = (y * FRAME_WIDTH as usize + x) * 4;
-                frame.pixels_rgba8[offset] = intensity;
-                frame.pixels_rgba8[offset + 1] = intensity;
-                frame.pixels_rgba8[offset + 2] = intensity;
-                frame.pixels_rgba8[offset + 3] = 0xFF;
-            }
-        }
-
-        Ok(frame)
-    }
-}
-
-impl MachineControl for GbMachine {
-    type Error = GbError;
-
-    fn reset(&mut self) -> Result<(), Self::Error> {
-        self.reset_state();
-        Ok(())
-    }
-
-    fn run(&mut self) -> Result<RunResult, Self::Error> {
-        for _ in 0..DEFAULT_RUN_LIMIT {
-            let result = self.execute_next_instruction()?;
-            if result.stop_reason != StopReason::StepComplete {
-                return Ok(result);
-            }
-        }
-
-        Ok(RunResult {
-            stop_reason: StopReason::RunLimitReached,
-        })
-    }
-
-    fn step_instruction(&mut self) -> Result<RunResult, Self::Error> {
-        self.execute_next_instruction()
-    }
-
-    fn add_breakpoint(&mut self, breakpoint: Breakpoint) -> Result<(), Self::Error> {
-        self.breakpoints.push(breakpoint);
-        Ok(())
-    }
-
-    fn clear_breakpoints(&mut self) -> Result<(), Self::Error> {
-        self.breakpoints.clear();
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use gbbrain_core::{Breakpoint, Machine, MachineControl, MemoryRegion, StopReason};
-
-    use super::{
-        ExecState, GbMachine, IF_REGISTER, LCDC_REGISTER, LY_REGISTER, TIMER_DIV, TIMER_TAC, TIMER_TIMA,
-        TIMER_TMA,
-    };
-
-    #[test]
-    fn step_advances_pc_for_nop() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-
-        let result = machine.step_instruction().unwrap();
-        let snapshot = machine.snapshot();
-
-        assert_eq!(result.stop_reason, StopReason::StepComplete);
-        assert_eq!(snapshot.registers.pc, 0x0101);
-        assert_eq!(snapshot.instruction_counter, 1);
-    }
-
-    #[test]
-    fn program_counter_breakpoint_stops_run() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100] = 0x00;
-        rom[0x101] = 0x00;
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.add_breakpoint(Breakpoint::ProgramCounter(0x0101)).unwrap();
-
-        let result = machine.run().unwrap();
-
-        assert_eq!(result.stop_reason, StopReason::BreakpointHit);
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-    }
-
-    #[test]
-    fn memory_write_watchpoint_triggers() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100] = 0x3E;
-        rom[0x101] = 0x42;
-        rom[0x102] = 0xEA;
-        rom[0x103] = 0x00;
-        rom[0x104] = 0xC0;
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.add_breakpoint(Breakpoint::MemoryWrite(0xC000)).unwrap();
-
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::WatchpointHit);
-        assert_eq!(
-            machine.inspect_memory(MemoryRegion::Ram, 0, 1).unwrap(),
-            vec![0x42]
-        );
-    }
-
-    #[test]
-    fn opcode_breakpoint_stops_before_execution() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100] = 0x00;
-        rom[0x101] = 0x40;
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.add_breakpoint(Breakpoint::Opcode(0x40)).unwrap();
-
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-
-        let result = machine.run().unwrap();
-        assert_eq!(result.stop_reason, StopReason::BreakpointHit);
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-    }
-
-    #[test]
-    fn direct_system_address_read_write_works() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-
-        machine.write_system_address(0xC000, 0x42);
-
-        assert_eq!(machine.read_system_address(0xC000), 0x42);
-        assert_eq!(
-            machine.inspect_memory(MemoryRegion::AddressSpace(gbbrain_core::AddressSpace::System), 0xC000, 1)
-                .unwrap(),
-            vec![0x42]
-        );
-    }
-
-    #[test]
-    fn ei_enables_interrupts_after_following_instruction() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100] = 0xFB;
-        rom[0x101] = 0x00;
-        rom[0x102] = 0x00;
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.ie = 0x01;
-        machine.request_interrupt(0x01);
-
-        machine.step_instruction().unwrap();
-        assert!(machine.ime);
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-
-        machine.step_instruction().unwrap();
-        assert!(machine.ime);
-        assert_eq!(machine.snapshot().registers.pc, 0x0102);
-
-        machine.step_instruction().unwrap();
-        assert!(!machine.ime);
-        assert_eq!(machine.snapshot().registers.pc, 0x0040);
-    }
-
-    #[test]
-    fn halt_bug_repeats_next_opcode_when_interrupts_pending_and_ime_clear() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100] = 0x76;
-        rom[0x101] = 0x00;
-        rom[0x102] = 0x00;
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.ie = 0x01;
-        machine.request_interrupt(0x01);
-
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert!(!matches!(machine.exec_state, ExecState::Halt));
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert_eq!(machine.snapshot().registers.pc, 0x0101);
-
-        assert_eq!(machine.step_instruction().unwrap().stop_reason, StopReason::StepComplete);
-        assert_eq!(machine.snapshot().registers.pc, 0x0102);
-    }
-
-    #[test]
-    fn trace_entries_record_executed_instructions() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-
-        machine.step_instruction().unwrap();
-        machine.step_instruction().unwrap();
-
-        let trace = machine.trace_entries();
-        assert_eq!(trace.len(), 2);
-        assert_eq!(trace[0].pc, 0x0100);
-        assert_eq!(trace[1].instruction_counter, 2);
-    }
-
-    #[test]
-    fn serial_transfer_appends_output() {
-        let mut rom = vec![0; 0x200];
-        rom[0x100..0x10B].copy_from_slice(&[
-            0x3E, b'A', 0xEA, 0x01, 0xFF, 0x3E, 0x81, 0xEA, 0x02, 0xFF, 0x76,
-        ]);
-
-        let mut machine = GbMachine::new(rom).unwrap();
-        assert!(machine.run().is_ok());
-        assert_eq!(machine.serial_output(), b"A");
-    }
-
-    #[test]
-    fn timer_overflow_requests_interrupt() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-        machine.write8(TIMER_DIV, 0x00);
-        machine.write8(IF_REGISTER, 0x00);
-        machine.write8(TIMER_TMA, 0x77);
-        machine.write8(TIMER_TIMA, 0xFF);
-        machine.write8(TIMER_TAC, 0x05);
-        machine.tick_timers(16);
-
-        assert_eq!(machine.read8(TIMER_TIMA), 0x00);
-        assert_eq!(machine.read8(IF_REGISTER) & 0x04, 0);
-
-        machine.tick_timers(4);
-
-        assert_eq!(machine.read8(TIMER_TIMA), 0x77);
-        assert_ne!(machine.read8(IF_REGISTER) & 0x04, 0);
-    }
-
-    #[test]
-    fn lcd_enable_starts_first_visible_line_on_blargg_window() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-
-        machine.write8(LCDC_REGISTER, 0x00);
-        machine.write8(LCDC_REGISTER, 0x81);
-        machine.tick_timers(112 * 4);
-        assert_eq!(machine.read8(LY_REGISTER), 0);
-        machine.tick_timers(4);
-        assert_eq!(machine.read8(LY_REGISTER), 1);
-    }
-
-    #[test]
-    #[ignore = "exploratory timing probe for Blargg init_timer; not a stable invariant yet"]
-    fn blargg_init_timer_window_matches_expected_if_edge() {
-        let rom = vec![0; 0x200];
-        let mut machine = GbMachine::new(rom).unwrap();
-
-        machine.ie &= !0x04;
-        machine.write8(TIMER_TMA, 0x00);
-        machine.write8(TIMER_TAC, 0x05);
-        machine.write8(IF_REGISTER, 0x00);
-        machine.write8(TIMER_TIMA, 0xEC);
-
-        machine.tick_timers(70);
-
-        assert_eq!(machine.read8(IF_REGISTER) & 0x04, 0);
-
-        let mut triggered_after = None;
-        for extra in 1..=32 {
-            machine.tick_timers(1);
-            if machine.read8(IF_REGISTER) & 0x04 != 0 {
-                triggered_after = Some(extra);
-                break;
-            }
-        }
-
-        assert_eq!(triggered_after, Some(7));
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GbModel {
     Dmg0,

@@ -2,6 +2,7 @@
 /roms
 /test-roms
 /.codex
+/AGENTS.md
 *.gb
 *.gbc
 *.gba

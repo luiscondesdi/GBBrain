@@ -12,6 +12,7 @@ use gbbrain_core::{
 use gbbrain_gb::{DebugState, DisassembledInstruction, GbMachine, GbModel, TraceEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -21,7 +22,9 @@ fn main() -> ExitCode {
         Some("suite") => run_suite(&args[2..]),
         Some(path) => run_single_shot(path),
         None => {
-            eprintln!("usage: gbbrain <rom-path> | gbbrain serve | gbbrain suite dmg [blargg|mooneye|all]");
+            eprintln!(
+                "usage: gbbrain <rom-path> | gbbrain serve | gbbrain suite dmg [blargg|mooneye|all]"
+            );
             ExitCode::from(2)
         }
     }
@@ -52,7 +55,9 @@ fn run_suite(args: &[String]) -> ExitCode {
 
     if roms.is_empty() {
         eprintln!("no matching ROMs found for suite '{suite}'");
-        eprintln!("expected Blargg under test-roms/blargg and Mooneye ROM binaries under test-roms/mooneye/build/acceptance");
+        eprintln!(
+            "expected Blargg under test-roms/blargg and Mooneye ROM binaries under test-roms/mooneye/build/acceptance"
+        );
         return ExitCode::from(1);
     }
 
@@ -265,7 +270,10 @@ fn discover_mooneye_dmg_roms() -> Vec<PathBuf> {
         .lines()
         .map(PathBuf::from)
         .filter(|path| {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             !name.contains("-cgb")
                 && !name.contains("-agb")
                 && !name.contains("-ags")
@@ -291,7 +299,8 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
     };
 
     let model = infer_model_from_rom_path(path);
-    if let Err(error) = client.load_rom(path, model) {
+    let bootrom_path = resolve_bootrom_path(model);
+    if let Err(error) = client.load_rom(path, model, bootrom_path.as_deref()) {
         return SuiteResult {
             status: SuiteStatus::Error,
             detail: Some(error),
@@ -448,7 +457,10 @@ fn run_dmg_test_rom(path: &Path) -> SuiteResult {
 }
 
 fn infer_model_from_rom_path(path: &Path) -> &'static str {
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
     if name.contains("-dmg0") {
         "dmg0"
     } else if name.contains("-mgb") {
@@ -464,7 +476,70 @@ fn infer_model_from_rom_path(path: &Path) -> &'static str {
     }
 }
 
-fn detect_blargg_ram_result(client: &mut StdioSession) -> Result<Option<(SuiteStatus, String)>, String> {
+fn resolve_bootrom_path(model: &str) -> Option<PathBuf> {
+    let key = match model {
+        "dmg0" => "GBBRAIN_BOOTROM_DMG0",
+        "dmg" => "GBBRAIN_BOOTROM_DMG",
+        "mgb" => "GBBRAIN_BOOTROM_MGB",
+        "sgb" => "GBBRAIN_BOOTROM_SGB",
+        "sgb2" => "GBBRAIN_BOOTROM_SGB2",
+        _ => return None,
+    };
+    env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+}
+
+fn expected_bootrom_sha256(model: GbModel) -> &'static str {
+    match model {
+        GbModel::Dmg0 => "26e71cf01e301e5dc40e987cd2ecbf6d0276245890ac829db2a25323da86818e",
+        GbModel::Dmg => "cf053eccb4ccafff9e67339d4e78e98dce7d1ed59be819d2a1ba2232c6fce1c7",
+        GbModel::Mgb => "a8cb5f4f1f16f2573ed2ecd8daedb9c5d1dd2c30a481f9b179b5d725d95eafe2",
+        GbModel::Sgb => "0e4ddff32fc9d1eeaae812a157dd246459b00c9e14f2f61751f661f32361e360",
+        GbModel::Sgb2 => "fd243c4fb27008986316ce3df29e9cfbcdc0cd52704970555a8bb76edbec3988",
+    }
+}
+
+fn synthetic_bootrom_warnings(rom: &[u8], bootrom_path: Option<&str>) -> Vec<String> {
+    if bootrom_path.is_some() || rom.len() < 0x150 {
+        return Vec::new();
+    }
+
+    let cartridge_type = rom[0x147];
+    let rom_size = rom[0x148];
+    let mut warnings = Vec::new();
+
+    if matches!(cartridge_type, 0x01..=0x03) && rom_size == 0x05 {
+        warnings.push(
+            "synthetic boot ROM in use: 1 MiB MBC1 cartridges may be multicarts; use a real boot ROM if menu or game-selection behavior matters"
+                .to_string(),
+        );
+    }
+
+    warnings
+}
+
+fn default_cart_state_path_for_rom(rom_path: &Path) -> PathBuf {
+    let file_name = rom_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cartridge");
+    rom_path.with_file_name(format!("{file_name}.gbbrain-cart.json"))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn detect_blargg_ram_result(
+    client: &mut StdioSession,
+) -> Result<Option<(SuiteStatus, String)>, String> {
     let bytes = client.inspect_memory("system", 0xA000, 64)?;
     if bytes.len() < 4 || bytes[1..4] != [0xDE, 0xB0, 0x61] {
         return Ok(None);
@@ -480,9 +555,15 @@ fn detect_blargg_ram_result(client: &mut StdioSession) -> Result<Option<(SuiteSt
         .position(|&byte| byte == 0)
         .map(|index| 4 + index)
         .unwrap_or(bytes.len());
-    let text = String::from_utf8_lossy(&bytes[4..text_end]).trim().to_string();
+    let text = String::from_utf8_lossy(&bytes[4..text_end])
+        .trim()
+        .to_string();
 
-    let suite_status = if status == 0 { SuiteStatus::Pass } else { SuiteStatus::Fail };
+    let suite_status = if status == 0 {
+        SuiteStatus::Pass
+    } else {
+        SuiteStatus::Fail
+    };
     let detail = if text.is_empty() {
         format!("detected Blargg RAM result code {status}")
     } else {
@@ -493,9 +574,12 @@ fn detect_blargg_ram_result(client: &mut StdioSession) -> Result<Option<(SuiteSt
 }
 
 fn detect_mooneye_result(snapshot: &SnapshotDto) -> Option<SuiteStatus> {
-    let pass = [snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l]
-        == [3, 5, 8, 13, 21, 34];
-    let fail = [snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l] == [0x42; 6];
+    let pass = [
+        snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l,
+    ] == [3, 5, 8, 13, 21, 34];
+    let fail = [
+        snapshot.b, snapshot.c, snapshot.d, snapshot.e, snapshot.h, snapshot.l,
+    ] == [0x42; 6];
 
     if pass {
         Some(SuiteStatus::Pass)
@@ -519,7 +603,8 @@ struct RunOutcome {
 
 impl StdioSession {
     fn spawn() -> Result<Self, String> {
-        let exe = env::current_exe().map_err(|error| format!("failed to resolve current executable: {error}"))?;
+        let exe = env::current_exe()
+            .map_err(|error| format!("failed to resolve current executable: {error}"))?;
         let mut child = Command::new(exe)
             .arg("serve")
             .stdin(Stdio::piped())
@@ -545,11 +630,17 @@ impl StdioSession {
         })
     }
 
-    fn load_rom(&mut self, path: &Path, model: &str) -> Result<(), String> {
+    fn load_rom(
+        &mut self,
+        path: &Path,
+        model: &str,
+        bootrom_path: Option<&Path>,
+    ) -> Result<(), String> {
         self.request(json!({
             "command": "load_rom",
             "path": path,
-            "model": model
+            "model": model,
+            "bootrom_path": bootrom_path
         }))
         .map(|_| ())
     }
@@ -571,7 +662,12 @@ impl StdioSession {
             .map_err(|error| format!("invalid serial output response: {error}"))
     }
 
-    fn inspect_memory(&mut self, region: &str, address: u32, len: usize) -> Result<Vec<u8>, String> {
+    fn inspect_memory(
+        &mut self,
+        region: &str,
+        address: u32,
+        len: usize,
+    ) -> Result<Vec<u8>, String> {
         let response = self.request(json!({
             "command": "inspect_memory",
             "region": region,
@@ -659,8 +755,8 @@ impl StdioSession {
             return Err("server process closed stdout".to_string());
         }
 
-        let response: ResponseEnvelope =
-            serde_json::from_str(&line).map_err(|error| format!("invalid response JSON: {error}"))?;
+        let response: ResponseEnvelope = serde_json::from_str(&line)
+            .map_err(|error| format!("invalid response JSON: {error}"))?;
 
         if response.id != Some(json!(id)) {
             return Err(format!(
@@ -691,11 +787,7 @@ impl Drop for StdioSession {
     }
 }
 
-fn write_response(
-    output: &mut impl Write,
-    id: Option<Value>,
-    payload: Value,
-) -> io::Result<()> {
+fn write_response(output: &mut impl Write, id: Option<Value>, payload: Value) -> io::Result<()> {
     let mut response = payload;
     if let Some(id) = id {
         response["id"] = id;
@@ -709,9 +801,25 @@ fn write_response(
 struct SessionState {
     machine: Option<GbMachine>,
     rom_path: Option<PathBuf>,
+    cart_state_path: Option<PathBuf>,
 }
 
 impl SessionState {
+    fn flush_cart_state_if_configured(&self) -> Result<(), String> {
+        if let (Some(machine), Some(path)) = (&self.machine, &self.cart_state_path) {
+            let bytes = machine
+                .save_cartridge_state()
+                .map_err(|error| error.to_string())?;
+            fs::write(path, bytes).map_err(|error| {
+                format!(
+                    "failed to write cartridge state '{}': {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn snapshot_dto(machine: &GbMachine) -> SnapshotDto {
         let mut snapshot = SnapshotDto::from(machine.snapshot());
         snapshot.debug = DebugStateDto::from(machine.debug_state());
@@ -726,6 +834,7 @@ impl SessionState {
                     "ping",
                     "help",
                     "load_rom",
+                    "cartridge_info",
                     "reset",
                     "step",
                     "run_for_cycles",
@@ -735,9 +844,17 @@ impl SessionState {
                     "inspect_memory",
                     "read_address",
                     "write_address",
+                    "set_input",
+                    "get_input",
                     "disassemble",
                     "save_snapshot",
                     "load_snapshot",
+                    "save_cart_state",
+                    "load_cart_state",
+                    "save_cart_state_file",
+                    "load_cart_state_file",
+                    "export_save_ram",
+                    "import_save_ram",
                     "add_breakpoint",
                     "clear_breakpoints",
                     "get_trace",
@@ -750,7 +867,13 @@ impl SessionState {
                 "breakpoint_kinds": ["pc", "opcode", "memory_read", "memory_write"],
                 "models": ["dmg0", "dmg", "mgb", "sgb", "sgb2"]
             })),
-            Request::LoadRom { path, model } => self.load_rom(path, model),
+            Request::LoadRom {
+                path,
+                model,
+                bootrom_path,
+                cart_state_path,
+            } => self.load_rom(path, model, bootrom_path, cart_state_path),
+            Request::CartridgeInfo => self.cartridge_info(),
             Request::Reset => {
                 let machine = self.machine_mut()?;
                 machine.reset().map_err(|error| error.to_string())?;
@@ -768,9 +891,17 @@ impl SessionState {
                     "snapshot": Self::snapshot_dto(machine)
                 }))
             }
-            Request::Disassemble { address, count } => self.disassemble(address, count.unwrap_or(8)),
+            Request::Disassemble { address, count } => {
+                self.disassemble(address, count.unwrap_or(8))
+            }
             Request::SaveSnapshot => self.save_snapshot(),
             Request::LoadSnapshot { bytes_base64 } => self.load_snapshot(bytes_base64),
+            Request::SaveCartState => self.save_cart_state(),
+            Request::LoadCartState { bytes_base64 } => self.load_cart_state(bytes_base64),
+            Request::SaveCartStateFile { path } => self.save_cart_state_file(path),
+            Request::LoadCartStateFile { path } => self.load_cart_state_file(path),
+            Request::ExportSaveRam { path } => self.export_save_ram(path),
+            Request::ImportSaveRam { path } => self.import_save_ram(path),
             Request::InspectMemory {
                 region,
                 address,
@@ -778,6 +909,8 @@ impl SessionState {
             } => self.inspect_memory(region, address, len),
             Request::ReadAddress { address } => self.read_address(address),
             Request::WriteAddress { address, value } => self.write_address(address, value),
+            Request::SetInput { buttons } => self.set_input(buttons),
+            Request::GetInput => self.get_input(),
             Request::AddBreakpoint { kind, address } => self.add_breakpoint(&kind, address),
             Request::ClearBreakpoints => {
                 let machine = self.machine_mut()?;
@@ -799,20 +932,74 @@ impl SessionState {
                 Ok(json!({ "cleared": true }))
             }
             Request::RenderFrame { target, encoding } => self.render_frame(target, encoding),
-            Request::Shutdown => Ok(json!({ "shutdown": true })),
+            Request::Shutdown => self.shutdown(),
         }
     }
 
-    fn load_rom(&mut self, path: String, model: Option<String>) -> Result<Value, String> {
-        let rom = fs::read(&path).map_err(|error| format!("failed to read ROM '{path}': {error}"))?;
+    fn load_rom(
+        &mut self,
+        path: String,
+        model: Option<String>,
+        bootrom_path: Option<String>,
+        cart_state_path: Option<String>,
+    ) -> Result<Value, String> {
+        self.flush_cart_state_if_configured()?;
+
+        let rom =
+            fs::read(&path).map_err(|error| format!("failed to read ROM '{path}': {error}"))?;
         let model = match model {
-            Some(name) => GbModel::from_name(&name)
-                .ok_or_else(|| format!("unsupported model: {name}"))?,
+            Some(name) => {
+                GbModel::from_name(&name).ok_or_else(|| format!("unsupported model: {name}"))?
+            }
             None => GbModel::Dmg,
         };
-        let machine = GbMachine::new_with_model(rom, model).map_err(|error| error.to_string())?;
+        let bootrom = match bootrom_path.as_ref() {
+            Some(path) => {
+                let bytes = fs::read(path)
+                    .map_err(|error| format!("failed to read boot ROM '{path}': {error}"))?;
+                let actual_hash = sha256_hex(&bytes);
+                let expected_hash = expected_bootrom_sha256(model);
+                if actual_hash != expected_hash {
+                    return Err(format!(
+                        "boot ROM hash does not match model {}: expected {}, got {}",
+                        model.as_name(),
+                        expected_hash,
+                        actual_hash
+                    ));
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+        let warnings = synthetic_bootrom_warnings(&rom, bootrom_path.as_deref());
+        let mut machine = GbMachine::new_with_model_and_bootrom(rom, model, bootrom)
+            .map_err(|error| error.to_string())?;
+        let effective_cart_state_path = cart_state_path.as_ref().map(PathBuf::from).or_else(|| {
+            if machine.cartridge_has_battery() || machine.cartridge_has_rtc() {
+                Some(default_cart_state_path_for_rom(Path::new(&path)))
+            } else {
+                None
+            }
+        });
+        if let Some(path) = effective_cart_state_path.as_ref() {
+            if Path::new(path).exists() {
+                let bytes = fs::read(path).map_err(|error| {
+                    format!(
+                        "failed to read cartridge state '{}': {error}",
+                        path.display()
+                    )
+                })?;
+                machine.load_cartridge_state(&bytes).map_err(|error| {
+                    format!(
+                        "failed to load cartridge state '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
         self.machine = Some(machine);
         self.rom_path = Some(PathBuf::from(&path));
+        self.cart_state_path = effective_cart_state_path.clone();
         let machine = self.machine.as_ref().expect("machine just loaded");
         let snapshot = Self::snapshot_dto(machine);
 
@@ -820,7 +1007,26 @@ impl SessionState {
             "platform": "gb",
             "model": machine.model().as_name(),
             "rom_path": path,
+            "bootrom_path": bootrom_path,
+            "cart_state_path": effective_cart_state_path,
+            "warnings": warnings,
+            "cartridge": {
+                "title": machine.cartridge_title(),
+                "type_code": machine.cartridge_type_code(),
+                "has_battery": machine.cartridge_has_battery(),
+                "has_rtc": machine.cartridge_has_rtc()
+            },
             "snapshot": snapshot
+        }))
+    }
+
+    fn cartridge_info(&self) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        Ok(json!({
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code(),
+            "has_battery": machine.cartridge_has_battery(),
+            "has_rtc": machine.cartridge_has_rtc()
         }))
     }
 
@@ -891,7 +1097,10 @@ impl SessionState {
         let stop_reason = if let Some(limit) = max_instructions {
             execute_for_instructions(machine, limit)?
         } else {
-            machine.run().map_err(|error| error.to_string())?.stop_reason
+            machine
+                .run()
+                .map_err(|error| error.to_string())?
+                .stop_reason
         };
 
         Ok(json!({
@@ -905,12 +1114,7 @@ impl SessionState {
         }))
     }
 
-    fn inspect_memory(
-        &self,
-        region: String,
-        address: u32,
-        len: usize,
-    ) -> Result<Value, String> {
+    fn inspect_memory(&self, region: String, address: u32, len: usize) -> Result<Value, String> {
         let machine = self.machine_ref()?;
         let region = parse_memory_region(&region)?;
         let bytes = machine
@@ -954,13 +1158,46 @@ impl SessionState {
 
     fn disassemble(&self, address: u32, count: usize) -> Result<Value, String> {
         let machine = self.machine_ref()?;
-        let address = u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
+        let address =
+            u16::try_from(address).map_err(|_| format!("address out of range: {address}"))?;
         let instructions: Vec<DisassemblyDto> = machine
             .disassemble_range(address, count)
             .into_iter()
             .map(DisassemblyDto::from)
             .collect();
         Ok(json!({ "instructions": instructions }))
+    }
+
+    fn set_input(&mut self, buttons: Vec<String>) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let mut mask = 0u8;
+        for button in buttons {
+            let bit = match button.as_str() {
+                "right" => 0,
+                "left" => 1,
+                "up" => 2,
+                "down" => 3,
+                "a" => 4,
+                "b" => 5,
+                "select" => 6,
+                "start" => 7,
+                _ => return Err(format!("unsupported button: {button}")),
+            };
+            mask |= 1 << bit;
+        }
+        machine.set_pressed_buttons_mask(mask);
+        Ok(json!({
+            "buttons": machine.pressed_button_names(),
+            "p1": machine.read_system_address(0xFF00)
+        }))
+    }
+
+    fn get_input(&mut self) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        Ok(json!({
+            "buttons": machine.pressed_button_names(),
+            "p1": machine.read_system_address(0xFF00)
+        }))
     }
 
     fn save_snapshot(&self) -> Result<Value, String> {
@@ -984,6 +1221,99 @@ impl SessionState {
         }))
     }
 
+    fn save_cart_state(&self) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        let bytes = machine
+            .save_cartridge_state()
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "format": "gbbrain.gb.cart_state.v1+json",
+            "bytes_base64": BASE64.encode(bytes)
+        }))
+    }
+
+    fn load_cart_state(&mut self, bytes_base64: String) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let bytes = BASE64
+            .decode(bytes_base64)
+            .map_err(|error| format!("invalid base64 cartridge state: {error}"))?;
+        machine
+            .load_cartridge_state(&bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code()
+        }))
+    }
+
+    fn save_cart_state_file(&self, path: String) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        let bytes = machine
+            .save_cartridge_state()
+            .map_err(|error| error.to_string())?;
+        fs::write(&path, bytes)
+            .map_err(|error| format!("failed to write cartridge state '{path}': {error}"))?;
+        Ok(json!({
+            "path": path,
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code()
+        }))
+    }
+
+    fn load_cart_state_file(&mut self, path: String) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("failed to read cartridge state '{path}': {error}"))?;
+        machine
+            .load_cartridge_state(&bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "path": path,
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code()
+        }))
+    }
+
+    fn export_save_ram(&self, path: String) -> Result<Value, String> {
+        let machine = self.machine_ref()?;
+        let bytes = machine.save_cartridge_ram();
+        fs::write(&path, bytes)
+            .map_err(|error| format!("failed to write save RAM '{path}': {error}"))?;
+        Ok(json!({
+            "path": path,
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code()
+        }))
+    }
+
+    fn import_save_ram(&mut self, path: String) -> Result<Value, String> {
+        let machine = self.machine_mut()?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("failed to read save RAM '{path}': {error}"))?;
+        machine
+            .load_cartridge_ram(&bytes)
+            .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "path": path,
+            "title": machine.cartridge_title(),
+            "type_code": machine.cartridge_type_code()
+        }))
+    }
+
+    fn shutdown(&mut self) -> Result<Value, String> {
+        self.flush_cart_state_if_configured()
+            .map_err(|error| format!("failed to flush cartridge state during shutdown: {error}"))?;
+
+        if let Some(path) = &self.cart_state_path {
+            return Ok(json!({
+                "shutdown": true,
+                "cart_state_path": path,
+            }));
+        }
+
+        Ok(json!({ "shutdown": true }))
+    }
+
     fn add_breakpoint(&mut self, kind: &str, address: u32) -> Result<Value, String> {
         let machine = self.machine_mut()?;
         let breakpoint = parse_breakpoint(kind, address)?;
@@ -1005,7 +1335,9 @@ impl SessionState {
         let machine = self.machine_ref()?;
         let target = parse_render_target(target.as_deref().unwrap_or("main"))?;
         let encoding = encoding.unwrap_or_else(|| "base64".to_string());
-        let frame = machine.render_frame(target).map_err(|error| error.to_string())?;
+        let frame = machine
+            .render_frame(target)
+            .map_err(|error| error.to_string())?;
 
         match encoding.as_str() {
             "base64" => Ok(json!({
@@ -1084,26 +1416,85 @@ struct RequestEnvelope {
 enum Request {
     Ping,
     Help,
-    LoadRom { path: String, model: Option<String> },
+    LoadRom {
+        path: String,
+        model: Option<String>,
+        bootrom_path: Option<String>,
+        cart_state_path: Option<String>,
+    },
+    CartridgeInfo,
     Reset,
-    Step { count: Option<u64> },
-    RunForCycles { cycles: u64 },
-    RunForInstructions { count: u64 },
-    Run { max_instructions: Option<u64> },
+    Step {
+        count: Option<u64>,
+    },
+    RunForCycles {
+        cycles: u64,
+    },
+    RunForInstructions {
+        count: u64,
+    },
+    Run {
+        max_instructions: Option<u64>,
+    },
     Snapshot,
-    InspectMemory { region: String, address: u32, len: usize },
-    ReadAddress { address: u32 },
-    WriteAddress { address: u32, value: u32 },
-    Disassemble { address: u32, count: Option<usize> },
+    InspectMemory {
+        region: String,
+        address: u32,
+        len: usize,
+    },
+    ReadAddress {
+        address: u32,
+    },
+    WriteAddress {
+        address: u32,
+        value: u32,
+    },
+    SetInput {
+        #[serde(default)]
+        buttons: Vec<String>,
+    },
+    GetInput,
+    Disassemble {
+        address: u32,
+        count: Option<usize>,
+    },
     SaveSnapshot,
-    LoadSnapshot { bytes_base64: String },
-    AddBreakpoint { kind: String, address: u32 },
+    LoadSnapshot {
+        bytes_base64: String,
+    },
+    SaveCartState,
+    LoadCartState {
+        bytes_base64: String,
+    },
+    SaveCartStateFile {
+        path: String,
+    },
+    LoadCartStateFile {
+        path: String,
+    },
+    ExportSaveRam {
+        path: String,
+    },
+    ImportSaveRam {
+        path: String,
+    },
+    AddBreakpoint {
+        kind: String,
+        address: u32,
+    },
     ClearBreakpoints,
-    GetTrace { limit: Option<usize> },
+    GetTrace {
+        limit: Option<usize>,
+    },
     ClearTrace,
-    GetSerialOutput { encoding: Option<String> },
+    GetSerialOutput {
+        encoding: Option<String>,
+    },
     ClearSerialOutput,
-    RenderFrame { target: Option<String>, encoding: Option<String> },
+    RenderFrame {
+        target: Option<String>,
+        encoding: Option<String>,
+    },
     Shutdown,
 }
 
@@ -1298,7 +1689,9 @@ fn parse_memory_region(region: &str) -> Result<MemoryRegion, String> {
         "ram" => Ok(MemoryRegion::Ram),
         "vram" => Ok(MemoryRegion::Vram),
         "oam" => Ok(MemoryRegion::Oam),
-        "system" => Ok(MemoryRegion::AddressSpace(gbbrain_core::AddressSpace::System)),
+        "system" => Ok(MemoryRegion::AddressSpace(
+            gbbrain_core::AddressSpace::System,
+        )),
         _ => Err(format!("unsupported memory region: {region}")),
     }
 }
@@ -1359,7 +1752,12 @@ fn execute_for_instructions(machine: &mut GbMachine, count: u64) -> Result<StopR
 fn execute_for_cycles(machine: &mut GbMachine, cycles: u64) -> Result<&'static str, String> {
     let start_cycles = machine.debug_state().cycle_counter;
 
-    while machine.debug_state().cycle_counter.saturating_sub(start_cycles) < cycles {
+    while machine
+        .debug_state()
+        .cycle_counter
+        .saturating_sub(start_cycles)
+        < cycles
+    {
         let result = machine
             .step_instruction()
             .map_err(|error| error.to_string())?;

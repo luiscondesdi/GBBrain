@@ -60,6 +60,20 @@ Returns the current command list, supported breakpoint kinds, and supported mach
 
 If omitted, the server defaults to `dmg`.
 
+`bootrom_path` and `cart_state_path` are optional. If `cart_state_path` is provided and the file exists, cartridge-backed RAM/RTC state is loaded immediately after the ROM is created.
+If `cart_state_path` is omitted for a battery-backed or RTC-backed cartridge, the server derives a default path next to the ROM named `<rom-filename>.gbbrain-cart.json`.
+If a cartridge state path is active, the server also writes the current cartridge-backed RAM/RTC state back to that path on `shutdown`.
+
+The response also includes cartridge metadata such as title, type code, battery presence, and RTC presence.
+
+### `cartridge_info`
+
+Returns metadata for the currently loaded cartridge.
+
+```json
+{"id":2,"command":"cartridge_info"}
+```
+
 ### `reset`
 
 Resets the currently loaded machine.
@@ -137,6 +151,31 @@ Writes one byte into the system address space.
 {"id":9,"command":"write_address","address":49152,"value":66}
 ```
 
+### `set_input`
+
+Sets the currently pressed joypad buttons. Supported button names are:
+
+- `right`
+- `left`
+- `up`
+- `down`
+- `a`
+- `b`
+- `select`
+- `start`
+
+```json
+{"id":9,"command":"set_input","buttons":["start","a"]}
+```
+
+### `get_input`
+
+Returns the currently pressed buttons and the current `FF00/P1` joypad register value.
+
+```json
+{"id":9,"command":"get_input"}
+```
+
 ### `disassemble`
 
 Returns decoded instructions for an address range.
@@ -159,6 +198,54 @@ Loads a previously saved machine state from base64.
 
 ```json
 {"id":12,"command":"load_snapshot","bytes_base64":"..."}
+```
+
+### `save_cart_state`
+
+Serializes persistent cartridge-backed state as base64. This includes external RAM and RTC state when present.
+
+```json
+{"id":12,"command":"save_cart_state"}
+```
+
+### `load_cart_state`
+
+Loads previously saved persistent cartridge-backed state from base64.
+
+```json
+{"id":12,"command":"load_cart_state","bytes_base64":"..."}
+```
+
+### `save_cart_state_file`
+
+Writes persistent cartridge-backed state directly to a file.
+
+```json
+{"id":12,"command":"save_cart_state_file","path":"/absolute/path/to/game.savstate.json"}
+```
+
+### `load_cart_state_file`
+
+Loads persistent cartridge-backed state directly from a file.
+
+```json
+{"id":12,"command":"load_cart_state_file","path":"/absolute/path/to/game.savstate.json"}
+```
+
+### `export_save_ram`
+
+Writes raw cartridge RAM bytes to a file for interoperability with standard `.sav` workflows.
+
+```json
+{"id":12,"command":"export_save_ram","path":"/absolute/path/to/game.sav"}
+```
+
+### `import_save_ram`
+
+Loads raw cartridge RAM bytes from a file.
+
+```json
+{"id":12,"command":"import_save_ram","path":"/absolute/path/to/game.sav"}
 ```
 
 ### `add_breakpoint`
